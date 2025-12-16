@@ -12,3 +12,5 @@ pick
 numpy==1.25.2
 beautifulsoup4==4.13.4
 soundfile
+openai-whisper
+gradio
