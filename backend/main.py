@@ -70,6 +70,22 @@ CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
 
 
+def ensure_ffmpeg_installed() -> None:
+    """Install ffmpeg via apt-get if it is not already available."""
+    if shutil.which("ffmpeg"):
+        return
+    install_cmd = ["apt-get", "install", "-y", "ffmpeg"]
+    try:
+        subprocess.run(install_cmd, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("apt-get non è disponibile per installare ffmpeg.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("Installazione di ffmpeg tramite apt-get non riuscita.") from exc
+
+
+ensure_ffmpeg_installed()
+
+
 class ProcessOptions(BaseModel):
     filterlist: Optional[str] = None
     selected_chapters: Optional[List[int]] = None
