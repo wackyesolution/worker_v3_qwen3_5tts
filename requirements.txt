@@ -14,3 +14,6 @@ beautifulsoup4==4.13.4
 soundfile
 openai-whisper
 gradio
+fastapi
+uvicorn
+requests
