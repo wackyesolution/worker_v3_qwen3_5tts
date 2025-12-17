@@ -289,7 +289,8 @@ def build_interface() -> gr.Blocks:
             outputs=[status, ebook_download, paths_state],
         )
 
-    demo.queue(concurrency_count=1)
+    # Limit concurrency to a single job to keep preprocessing sequential.
+    demo.queue(default_concurrency_limit=1)
     return demo
 
 
