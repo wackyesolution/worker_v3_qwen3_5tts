@@ -179,12 +179,13 @@ def list_exports(book_id: int, export_dir: Path) -> List[Dict[str, str]]:
         kind = ARTIFACT_KINDS.get(suffix)
         if not kind:
             continue
-        run_id = artifact.stem.split("_")[-1] if "_" in artifact.stem else ""
+        match = RUN_ID_PATTERN.search(artifact.stem)
+        run_id = match.group(0) if match else ""
         exports.append(
             {
                 "kind": kind,
                 "path": str(artifact),
-                "run_id": run_id if RUN_ID_PATTERN.fullmatch(run_id) else run_id,
+                "run_id": run_id if run_id else "",
                 "name": artifact.name,
             }
         )
