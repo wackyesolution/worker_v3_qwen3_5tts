@@ -58,6 +58,7 @@ app = FastAPI(title="Chatterblez Backend", version="1.0.0")
 security = HTTPBasic()
 service_lock = threading.Lock()
 CURRENT_JOB: Optional[Dict[str, Any]] = None
+CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
 
 
 def ensure_backend_layout() -> None:
@@ -257,6 +258,25 @@ def get_current_job_status(
     }
 
 
+@app.post("/jobs/cancel")
+def cancel_current_job(user: Dict = Depends(get_current_user)):
+    job = CURRENT_JOB
+    if not job:
+        raise HTTPException(status_code=404, detail="Nessun job in esecuzione.")
+    if job["user_id"] != user["id"] and not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Non puoi annullare questo job.")
+    process = CURRENT_JOB_PROCESS
+    if not process:
+        return {"status": "idle"}
+    if process.poll() is not None:
+        return {"status": "completed"}
+    try:
+        process.terminate()
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Errore nell'annullamento: {exc}") from exc
+    return {"status": "cancelling"}
+
+
 @app.post("/books")
 async def upload_book(
     title: str = Form(...),
@@ -330,7 +350,7 @@ def list_books(user: Dict = Depends(get_current_user)):
 
 
 def run_pipeline(book: sqlite3.Row, user: Dict) -> Dict:
-    global CURRENT_JOB
+    global CURRENT_JOB, CURRENT_JOB_PROCESS
     import_path = Path(book["import_path"])
     if not import_path.exists():
         raise HTTPException(status_code=404, detail="File del libro non trovato.")
@@ -365,9 +385,11 @@ def run_pipeline(book: sqlite3.Row, user: Dict) -> Dict:
                 text=True,
             )
             CURRENT_JOB = job_info
+            CURRENT_JOB_PROCESS = process
             retcode = process.wait()
     finally:
         CURRENT_JOB = None
+        CURRENT_JOB_PROCESS = None
     if retcode != 0:
         log_excerpt = tail_lines(log_path, 30)
         raise HTTPException(

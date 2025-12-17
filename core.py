@@ -524,7 +524,8 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         selected_chapters = [c for c in selected_chapters if should_include(c)]
 
     print_selected_chapters(document_chapters, selected_chapters)
-    texts = [c.extracted_text for c in selected_chapters]
+    total_chars = sum(len(getattr(c, "extracted_text", "")) for c in selected_chapters)
+    total_words = sum(len(getattr(c, "extracted_text", "").split()) for c in selected_chapters)
 
     has_ffmpeg = shutil.which('ffmpeg') is not None
     if not has_ffmpeg:
@@ -535,7 +536,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         return
 
     stats = SimpleNamespace(
-        total_chars=sum(map(len, texts)),
+        total_chars=total_chars,
         processed_chars=0,
         chars_per_sec=500 if torch.cuda.is_available() else 50,  # initial guess
         start_time=time.perf_counter(),
@@ -544,7 +545,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
     )
     logging.info('Started at: %s', time.strftime('%H:%M:%S'))
     logging.info(f'Total characters: {stats.total_chars:,}')
-    logging.info('Total words: %d', len(' '.join(texts).split()))
+    logging.info('Total words: %d', total_words)
     eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
     logging.info(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
     chapter_wav_files = []
@@ -609,7 +610,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         start_time = time.time()
         if post_event and hasattr(chapter, "chapter_index"):
             post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
-        audio_segments = gen_audio_segments(
+        audio_chunks = gen_audio_segments(
             cb_model,
             nlp,
             text,
@@ -631,12 +632,10 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
             question_gap_ms=question_gap_ms
         )
         if should_stop():
-            logging.info("Synthesis interrupted by user (after audio_segments).")
+            logging.info("Synthesis interrupted by user (after audio generation).")
             break
-        if audio_segments:
-            final_audio = np.concatenate(audio_segments)
-            soundfile.write(chapter_wav_path, final_audio, sample_rate)
-
+        frames_written = write_audio_stream(chapter_wav_path, audio_chunks)
+        if frames_written > 0:
             if enable_silence_trimming:
                 trimmed_path = chapter_wav_path.with_suffix('.trimmed.wav')
                 remove_silence_from_audio(
@@ -652,7 +651,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
 
             end_time = time.time()
             delta_seconds = end_time - start_time
-            chars_per_sec = len(text) / delta_seconds
+            chars_per_sec = len(text) / delta_seconds if delta_seconds else 0
             logging.info('Chapter written to %s', chapter_wav_path)
             if post_event and hasattr(chapter, "chapter_index"):
                 post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
@@ -808,6 +807,30 @@ def print_selected_chapters(document_chapters, chapters):
     ], headers=['#', 'Chapter', 'Text Length', 'Selected', 'First words']))
 
 
+def write_audio_stream(chapter_wav_path: Path, chunks) -> int:
+    """
+    Write generated audio chunks directly to disk to avoid keeping entire chapters in memory.
+    Returns the number of samples written.
+    """
+    samples_written = 0
+    with soundfile.SoundFile(
+        chapter_wav_path,
+        mode="w",
+        samplerate=sample_rate,
+        channels=1,
+        subtype="PCM_16",
+    ) as wav_file:
+        for chunk in chunks:
+            if chunk is None:
+                continue
+            array = np.asarray(chunk, dtype=np.float32).flatten()
+            if array.size == 0:
+                continue
+            wav_file.write(array)
+            samples_written += array.shape[0]
+    return samples_written
+
+
 def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=None,
                        post_event=None, should_stop=None, repetition_penalty=1.2, min_p=0.05, top_p=1.0, exaggeration=0.5, cfg_weight=0.5, temperature=0.8,
                        use_multilingual=False, language_id='en', audio_prompt_wav=None, sentence_gap_ms=0, question_gap_ms=0):  # Use spacy to split into sentences
@@ -815,7 +838,6 @@ def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=Non
     if should_stop is None:
         should_stop = lambda: False
 
-    audio_segments = []
     doc = nlp(text)
     sentences = list(doc.sents)
     batch_min_chars=150
@@ -840,7 +862,7 @@ def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=Non
     for i, batch_text in enumerate(batches):
         if should_stop():
             logging.info("Synthesis interrupted by user (batch loop).")
-            return audio_segments
+            return
         if max_sentences and i >= max_sentences:
             break
 
@@ -871,7 +893,7 @@ def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=Non
                 cfg_weight=cfg_weight,
                 temperature=temperature
             )
-        audio_segments.append(wav.numpy().flatten())
+        yield wav.numpy().flatten()
 
         gap_duration = sentence_gap_ms
         if question_gap_ms > 0 and batch_text.rstrip().endswith('?'):
@@ -880,14 +902,14 @@ def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=Non
         if gap_duration > 0 and i < total_batches - 1:
             gap_samples = int(sample_rate * (gap_duration / 1000.0))
             if gap_samples > 0:
-                audio_segments.append(np.zeros(gap_samples, dtype=np.float32))
+                yield np.zeros(gap_samples, dtype=np.float32)
 
         # Update statistics based on batch size
         if stats:
             update_stats(stats, len(batch_text))
             if post_event:
                 post_event('CORE_PROGRESS', stats=stats)
-    return audio_segments
+    return
 
 
 def extract_chapter_number(chapter_name):
