@@ -371,7 +371,7 @@ def clean_line(line: str) -> str:
     line = space_re.sub(' ', line)                            # Collapse spaces
     return line.strip()
 def main(file_path, pick_manually, speed, book_year='', output_folder='.',
-         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None, audio_prompt_wav=None, batch_files=None, ignore_list=None, should_stop=None,
+         max_chapters=None, max_sentences=None, selected_chapters=None, selected_chapter_indices=None, post_event=None, audio_prompt_wav=None, batch_files=None, ignore_list=None, should_stop=None,
          repetition_penalty=1.1, min_p=0.02, top_p=0.95, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
          enable_silence_trimming=False, silence_thresh=-50, min_silence_len=500, keep_silence=100,
          use_multilingual=False, language_id='en', sentence_gap_ms=0, question_gap_ms=0, disable_alignment_guard=False):
@@ -512,6 +512,16 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
                 selected_chapters = find_good_chapters(document_chapters)
     if selected_chapters is None:
         selected_chapters = document_chapters
+
+    if selected_chapter_indices:
+        chapter_by_index = {c.chapter_index: c for c in document_chapters}
+        filtered = []
+        for idx in selected_chapter_indices:
+            chapter = chapter_by_index.get(idx)
+            if chapter:
+                filtered.append(chapter)
+        if filtered:
+            selected_chapters = filtered
 
     # Filter chapters based on ignore_list
     if ignore_list:

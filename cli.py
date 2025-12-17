@@ -19,6 +19,7 @@ def cli_main():
 
     parser.add_argument('-o', '--output', default='.', help='Output folder for the audiobook and temporary files', metavar='FOLDER')
     parser.add_argument('--filterlist', help='Comma-separated list of chapter names to ignore (case-insensitive substring match)')
+    parser.add_argument('--chapter-indices', help='Comma-separated chapter indexes to include (0-based).')
     parser.add_argument('--wav', help='Path to a WAV file for voice conditioning (audio prompt)')
     parser.add_argument('--speed', type=float, default=1.0, help='Speech speed (default: 1.0)')
     parser.add_argument('--cuda', default=True, help='Use GPU via Cuda in Torch if available', action='store_true')
@@ -60,6 +61,15 @@ def cli_main():
         parser.print_help(sys.stderr)
         sys.exit(1)
     args = parser.parse_args()
+    chapter_indices = None
+    if args.chapter_indices:
+        try:
+            chapter_indices = [
+                int(idx.strip()) for idx in args.chapter_indices.split(',') if idx.strip()
+            ]
+        except ValueError:
+            logging.error("Chapter indices must be integers separated by commas.")
+            sys.exit(1)
 
     if args.cuda:
         import torch.cuda
@@ -124,7 +134,8 @@ def cli_main():
             question_gap_ms=args.question_gap_ms,
             use_multilingual=args.use_multilingual,
             language_id=args.language_id,
-            disable_alignment_guard=args.disable_alignment_guard
+            disable_alignment_guard=args.disable_alignment_guard,
+            selected_chapter_indices=chapter_indices,
         )
     # Single file mode
     elif args.file:
@@ -156,7 +167,8 @@ def cli_main():
             question_gap_ms=args.question_gap_ms,
             use_multilingual=args.use_multilingual,
             language_id=args.language_id,
-            disable_alignment_guard=args.disable_alignment_guard
+            disable_alignment_guard=args.disable_alignment_guard,
+            selected_chapter_indices=chapter_indices,
         )
     elapsed_time = time.time() - start_time
     logging.info(f"Script finished in {elapsed_time:.2f} seconds")

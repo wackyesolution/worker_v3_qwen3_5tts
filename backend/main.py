@@ -29,6 +29,14 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
+from ebooklib import epub
+
+from core import (
+    find_document_chapters_and_extract_texts,
+    find_good_chapters,
+    extract_pdf_chapters,
+    chapter_beginning_one_liner,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +72,7 @@ CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
 
 class ProcessOptions(BaseModel):
     filterlist: Optional[str] = None
+    selected_chapters: Optional[List[int]] = None
 
 
 def ensure_backend_layout() -> None:
@@ -213,6 +222,35 @@ def describe_book(row: sqlite3.Row, export_dir: Path) -> Dict:
     }
 
 
+def list_book_chapters(row: sqlite3.Row) -> List[Dict[str, Any]]:
+    source = Path(row["import_path"])
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="File del libro non trovato.")
+    suffix = source.suffix.lower()
+    if suffix == ".epub":
+        book = epub.read_epub(str(source))
+        chapters = find_document_chapters_and_extract_texts(book)
+        default_selected = {c.chapter_index for c in find_good_chapters(chapters)}
+    elif suffix == ".pdf":
+        chapters = extract_pdf_chapters(str(source), row["title"])
+        default_selected = {c.chapter_index for c in chapters}
+    else:
+        raise HTTPException(status_code=400, detail="Formato non supportato per la lettura dei capitoli.")
+    payload = []
+    for chapter in chapters:
+        extracted = getattr(chapter, "extracted_text", "") or ""
+        payload.append(
+            {
+                "index": chapter.chapter_index,
+                "name": chapter.get_name(),
+                "preview": chapter_beginning_one_liner(chapter, 120),
+                "length": len(extracted),
+                "default_selected": chapter.chapter_index in default_selected,
+            }
+        )
+    return payload
+
+
 def tail_lines(path: Path, limit: int = 30) -> List[str]:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -355,7 +393,23 @@ def list_books(user: Dict = Depends(get_current_user)):
     }
 
 
-def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None) -> Dict:
+@app.get("/books/{book_id}/chapters")
+def get_book_chapters(book_id: int, user: Dict = Depends(get_current_user)):
+    book = require_book_owner(book_id, user["id"])
+    try:
+        chapters = list_book_chapters(book)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Impossibile leggere i capitoli: {exc}") from exc
+    return {
+        "book_id": book["id"],
+        "title": book["title"],
+        "chapters": chapters,
+    }
+
+
+def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None, selected_chapter_indices: Optional[List[int]] = None) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     import_path = Path(book["import_path"])
     if not import_path.exists():
@@ -374,6 +428,15 @@ def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None
     ]
     if filterlist:
         cmd += ["--filterlist", filterlist]
+    if selected_chapter_indices:
+        indices = []
+        for idx in selected_chapter_indices:
+            try:
+                indices.append(str(int(idx)))
+            except (TypeError, ValueError):
+                continue
+        if indices:
+            cmd += ["--chapter-indices", ",".join(indices)]
     job_info = {
         "book_id": book["id"],
         "book_title": book["title"],
@@ -477,7 +540,17 @@ def process_book(
     try:
         book = require_book_owner(book_id, user["id"])
         filterlist = (options.filterlist.strip() if options and options.filterlist else None)
-        job_state = run_pipeline(book, user, filterlist=filterlist)
+        selected_indices = None
+        if options and options.selected_chapters:
+            cleaned: List[int] = []
+            for value in options.selected_chapters:
+                try:
+                    cleaned.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            if cleaned:
+                selected_indices = cleaned
+        job_state = run_pipeline(book, user, filterlist=filterlist, selected_chapter_indices=selected_indices)
     finally:
         set_user_in_use(user["id"], False)
         if acquired:

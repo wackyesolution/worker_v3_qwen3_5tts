@@ -82,6 +82,10 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated chapter names to ignore during conversion.",
     )
     parser.add_argument(
+        "--chapter-indices",
+        help="Comma-separated indexes of chapters to include during synthesis.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -107,7 +111,7 @@ def ensure_directories(*directories: Path) -> None:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
 
-def build_cli_command(book_path: Path, output_dir: Path, filterlist: str | None = None) -> List[str]:
+def build_cli_command(book_path: Path, output_dir: Path, filterlist: str | None = None, chapter_indices: str | None = None) -> List[str]:
     cmd = [
         sys.executable,
         str(SCRIPT_DIR / "cli.py"),
@@ -119,6 +123,8 @@ def build_cli_command(book_path: Path, output_dir: Path, filterlist: str | None 
     ]
     if filterlist:
         cmd += ["--filterlist", filterlist]
+    if chapter_indices:
+        cmd += ["--chapter-indices", chapter_indices]
     return cmd
 
 
@@ -225,6 +231,7 @@ def process_book(
     skip_transcription: bool,
     run_id: str | None = None,
     filterlist: str | None = None,
+    chapter_indices: str | None = None,
 ) -> dict[str, Path | str | None]:
     book_path = resolve_book_path(str(book))
     book_basename = book_path.stem
@@ -235,7 +242,7 @@ def process_book(
     output_dir = output_base / f"{book_basename}_{run_token}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cli_command = build_cli_command(book_path, output_dir, filterlist)
+    cli_command = build_cli_command(book_path, output_dir, filterlist, chapter_indices)
     run_cli(cli_command)
 
     generated_m4b = find_generated_file(output_dir, "*.m4b", "final M4B file")
@@ -279,6 +286,7 @@ def main() -> None:
         skip_transcription=args.skip_transcription,
         run_id=args.run_id,
         filterlist=args.filterlist,
+        chapter_indices=args.chapter_indices,
     )
     logging.info("Run %s finished. Assets: %s", outputs["run_id"], outputs["folder"])
 
