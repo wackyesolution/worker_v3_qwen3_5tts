@@ -45,6 +45,7 @@ USERS_ROOT = BACKEND_ROOT / "users"
 LOGS_DIR = BACKEND_ROOT / "logs"
 PRE_SERVER = PROJECT_ROOT / "preServer.py"
 COLLECTION_DIR = PROJECT_ROOT / "audioBook"
+MAX_LOG_LINES = 10000
 
 SUPPORTED_EXTS = {".pdf", ".epub"}
 RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}$")
@@ -278,6 +279,19 @@ def tail_lines(path: Path, limit: int = 30) -> List[str]:
     return lines[-limit:]
 
 
+def trim_log_file(path: Path, retain_lines: int = MAX_LOG_LINES) -> None:
+    """Truncate a log file to at most `retain_lines` lines, keeping the newest ones."""
+    if retain_lines <= 0:
+        path.unlink(missing_ok=True)
+        return
+    lines = tail_lines(path, retain_lines)
+    if not lines:
+        return
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
+
+
 @app.get("/status")
 def api_status():
     with get_connection() as conn:
@@ -479,8 +493,9 @@ def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None
     finally:
         CURRENT_JOB = None
         CURRENT_JOB_PROCESS = None
+    log_excerpt = tail_lines(log_path, 30)
+    trim_log_file(log_path, MAX_LOG_LINES)
     if retcode != 0:
-        log_excerpt = tail_lines(log_path, 30)
         raise HTTPException(
             status_code=500,
             detail="Errore durante il job:\n" + "\n".join(log_excerpt),
@@ -529,7 +544,6 @@ def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None
         )
         conn.commit()
 
-    log_excerpt = tail_lines(log_path, 30)
     return {
         "run_id": run_id,
         "artifacts": artifacts,
