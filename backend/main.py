@@ -13,7 +13,6 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from collections import deque
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -252,12 +251,31 @@ def list_book_chapters(row: sqlite3.Row) -> List[Dict[str, Any]]:
 
 
 def tail_lines(path: Path, limit: int = 30) -> List[str]:
+    """Return the last `limit` lines of a potentially large log file efficiently."""
+    if limit <= 0:
+        return []
+    chunk_size = 8192
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            last_lines = deque(handle, maxlen=limit)
-            return [line.rstrip("\n") for line in last_lines]
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            chunks: List[bytes] = []
+            newline_count = 0
+            while position > 0 and newline_count <= limit:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                handle.seek(position)
+                chunk = handle.read(read_size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+            data = b"".join(reversed(chunks))
     except FileNotFoundError:
         return []
+    if not data:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    return lines[-limit:]
 
 
 @app.get("/status")
