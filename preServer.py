@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--whisper-model",
-        default="large-v3",
-        help="Name of the Whisper model to load (default: large-v3).",
+        default="small",
+        help="Name of the Whisper model to load (default: small).",
     )
     parser.add_argument(
         "--whisper-language",
