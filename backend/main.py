@@ -28,6 +28,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +60,10 @@ security = HTTPBasic()
 service_lock = threading.Lock()
 CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
+
+
+class ProcessOptions(BaseModel):
+    filterlist: Optional[str] = None
 
 
 def ensure_backend_layout() -> None:
@@ -350,7 +355,7 @@ def list_books(user: Dict = Depends(get_current_user)):
     }
 
 
-def run_pipeline(book: sqlite3.Row, user: Dict) -> Dict:
+def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     import_path = Path(book["import_path"])
     if not import_path.exists():
@@ -367,6 +372,8 @@ def run_pipeline(book: sqlite3.Row, user: Dict) -> Dict:
         "--run-id",
         run_id,
     ]
+    if filterlist:
+        cmd += ["--filterlist", filterlist]
     job_info = {
         "book_id": book["id"],
         "book_title": book["title"],
@@ -451,7 +458,11 @@ def run_pipeline(book: sqlite3.Row, user: Dict) -> Dict:
 
 
 @app.post("/books/{book_id}/process")
-def process_book(book_id: int, user: Dict = Depends(get_current_user)):
+def process_book(
+    book_id: int,
+    options: Optional[ProcessOptions] = None,
+    user: Dict = Depends(get_current_user),
+):
     job_state: Optional[Dict] = None
     with get_connection() as conn:
         cur = conn.execute("SELECT in_use FROM users WHERE id=?", (user["id"],))
@@ -465,7 +476,8 @@ def process_book(book_id: int, user: Dict = Depends(get_current_user)):
         raise HTTPException(status_code=409, detail="Il servizio sta processando un altro libro.")
     try:
         book = require_book_owner(book_id, user["id"])
-        job_state = run_pipeline(book, user)
+        filterlist = (options.filterlist.strip() if options and options.filterlist else None)
+        job_state = run_pipeline(book, user, filterlist=filterlist)
     finally:
         set_user_in_use(user["id"], False)
         if acquired:

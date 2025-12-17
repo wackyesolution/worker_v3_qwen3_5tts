@@ -78,6 +78,10 @@ def parse_args() -> argparse.Namespace:
         help="Optional identifier (timestamp) to reuse for output folders/files.",
     )
     parser.add_argument(
+        "--filterlist",
+        help="Comma-separated chapter names to ignore during conversion.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -103,8 +107,8 @@ def ensure_directories(*directories: Path) -> None:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
 
-def build_cli_command(book_path: Path, output_dir: Path) -> List[str]:
-    return [
+def build_cli_command(book_path: Path, output_dir: Path, filterlist: str | None = None) -> List[str]:
+    cmd = [
         sys.executable,
         str(SCRIPT_DIR / "cli.py"),
         "--file",
@@ -113,6 +117,9 @@ def build_cli_command(book_path: Path, output_dir: Path) -> List[str]:
         str(output_dir),
         *CLI_ARGUMENTS,
     ]
+    if filterlist:
+        cmd += ["--filterlist", filterlist]
+    return cmd
 
 
 def run_cli(command: Sequence[str]) -> None:
@@ -217,6 +224,7 @@ def process_book(
     whisper_language: str,
     skip_transcription: bool,
     run_id: str | None = None,
+    filterlist: str | None = None,
 ) -> dict[str, Path | str | None]:
     book_path = resolve_book_path(str(book))
     book_basename = book_path.stem
@@ -227,7 +235,7 @@ def process_book(
     output_dir = output_base / f"{book_basename}_{run_token}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cli_command = build_cli_command(book_path, output_dir)
+    cli_command = build_cli_command(book_path, output_dir, filterlist)
     run_cli(cli_command)
 
     generated_m4b = find_generated_file(output_dir, "*.m4b", "final M4B file")
@@ -270,6 +278,7 @@ def main() -> None:
         whisper_language=args.whisper_language,
         skip_transcription=args.skip_transcription,
         run_id=args.run_id,
+        filterlist=args.filterlist,
     )
     logging.info("Run %s finished. Assets: %s", outputs["run_id"], outputs["folder"])
 
