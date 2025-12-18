@@ -5,6 +5,7 @@
 # by Zachary Erskine
 # by Claudio Santini 2025 - https://claudio.uk
 import logging
+import json
 import os
 import sys
 import traceback
@@ -64,6 +65,7 @@ def disable_alignment_guard_checks():
     logging.info("Disabilitato il controllo di allineamento/repetition guard del modello multilingue.")
 
 sample_rate = 24000
+CHAPTER_MANIFEST_FILENAME = "chapter_exports.json"
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -374,7 +376,8 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
          max_chapters=None, max_sentences=None, selected_chapters=None, selected_chapter_indices=None, post_event=None, audio_prompt_wav=None, batch_files=None, ignore_list=None, should_stop=None,
          repetition_penalty=1.1, min_p=0.02, top_p=0.95, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
          enable_silence_trimming=False, silence_thresh=-50, min_silence_len=500, keep_silence=100,
-         use_multilingual=False, language_id='en', sentence_gap_ms=0, question_gap_ms=0, disable_alignment_guard=False):
+         use_multilingual=False, language_id='en', sentence_gap_ms=0, question_gap_ms=0, disable_alignment_guard=False,
+         per_chapter_export=False):
     """
     Main entry point for audiobook synthesis.
     - ignore_list: list of chapter names to ignore (case-insensitive substring match)
@@ -406,6 +409,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         "sentence_gap_ms":sentence_gap_ms,
         "question_gap_ms":question_gap_ms,
         "disable_alignment_guard":disable_alignment_guard,
+        "per_chapter_export":per_chapter_export,
     }
 
     # Log all parameters
@@ -447,6 +451,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
                 sentence_gap_ms=sentence_gap_ms,
                 question_gap_ms=question_gap_ms,
                 disable_alignment_guard=disable_alignment_guard,
+                per_chapter_export=per_chapter_export,
             )
             if post_event:
                 post_event('CORE_FILE_FINISHED', file_path=batch_file)
@@ -559,6 +564,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
     eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
     logging.info(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
     chapter_wav_files = []
+    chapter_exports = []
 
     import torchaudio as ta
     from chatterbox.tts import ChatterboxTTS
@@ -585,7 +591,6 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
     # AUDIO_PROMPT_PATH = "audio_prompt.wav"  # <-- Set this to your actual prompt file
     # cb_model.prepare_conditionals(wav_fpath=AUDIO_PROMPT_PATH)
 
-    chapter_wav_files = []
     nlp = get_nlp()
     for i, chapter in enumerate(selected_chapters, start=1):
         if should_stop():
@@ -604,7 +609,9 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         # Sanitize the chapter name to remove all non-alphanumeric characters for the filename
         xhtml_file_name = re.sub(r'[^a-zA-Z0-9-]', '', chapter.get_name()).replace('xhtml', '').replace('html', '')
         chapter_wav_path = Path(output_folder) / filename.replace(extension, f'_chapter_{xhtml_file_name}.wav')
-        chapter_wav_files.append(chapter_wav_path)
+        include_in_concat = not per_chapter_export
+        if include_in_concat:
+            chapter_wav_files.append(chapter_wav_path)
         if Path(chapter_wav_path).exists():
             logging.info(f'File for chapter {i} already exists. Skipping')
             stats.processed_chars += len(text)
@@ -613,7 +620,8 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
             continue
         if len(text.strip()) < 10:
             logging.info(f'Skipping empty chapter {i}')
-            chapter_wav_files.remove(chapter_wav_path)
+            if include_in_concat and chapter_wav_path in chapter_wav_files:
+                chapter_wav_files.remove(chapter_wav_path)
             continue
 
         logging.info(f'Writing  {text}')
@@ -666,14 +674,38 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
             if post_event and hasattr(chapter, "chapter_index"):
                 post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
             logging.info(f'Chapter {i} read in {delta_seconds:.2f} seconds ({chars_per_sec:.0f} characters per second)')
+            if per_chapter_export:
+                final_audio_path = convert_chapter_wav_to_m4a(chapter_wav_path)
+                chapter_exports.append(
+                    {
+                        "sequence": len(chapter_exports) + 1,
+                        "chapter_index": getattr(chapter, "chapter_index", i - 1),
+                        "chapter_name": chapter.get_name(),
+                        "audio_path": str(final_audio_path),
+                        "file_name": Path(final_audio_path).name,
+                    }
+                )
+                continue
         else:
             logging.warning(f'Warning: No audio generated for chapter {i}')
-            chapter_wav_files.remove(chapter_wav_path)
+            if include_in_concat and chapter_wav_path in chapter_wav_files:
+                chapter_wav_files.remove(chapter_wav_path)
 
-    if not chapter_wav_files:
-        logging.error("No audio chapters were generated. Cannot create audiobook.")
+    if per_chapter_export:
+        if not chapter_exports:
+            logging.error("No chapter exports were produced.")
+            if post_event:
+                post_event('CORE_ERROR', message="No chapter exports were produced.")
+            allow_sleep()
+            return
+        manifest_path = Path(output_folder) / CHAPTER_MANIFEST_FILENAME
+        manifest_path.write_text(
+            json.dumps({"chapters": chapter_exports}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logging.info("Per-chapter exports saved (%d files).", len(chapter_exports))
         if post_event:
-            post_event('CORE_ERROR', message="No audio chapters were generated.")
+            post_event('CORE_FINISHED')
         allow_sleep()
         return
 
@@ -839,6 +871,30 @@ def write_audio_stream(chapter_wav_path: Path, chunks) -> int:
             wav_file.write(array)
             samples_written += array.shape[0]
     return samples_written
+
+
+def convert_chapter_wav_to_m4a(source_path: Path) -> Path:
+    """
+    Convert the generated WAV file for a chapter into a compressed M4A file
+    to lower disk usage before the next chapter starts.
+    """
+    destination = source_path.with_suffix(".m4a")
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-i",
+        str(source_path),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        str(destination),
+    ]
+    logging.info("Converting %s -> %s", source_path.name, destination.name)
+    subprocess.run(ffmpeg_cmd, check=True)
+    source_path.unlink(missing_ok=True)
+    return destination
 
 
 def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=None,

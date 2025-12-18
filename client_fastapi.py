@@ -63,10 +63,19 @@ class BackendClient:
     def list_exports(self, book_id: int) -> Dict:
         return self._request("GET", f"/books/{book_id}/exports")
 
-    def download_artifact(self, book_id: int, kind: str, destination: Path, run_id: Optional[str] = None) -> Path:
+    def download_artifact(
+        self,
+        book_id: int,
+        kind: str,
+        destination: Path,
+        run_id: Optional[str] = None,
+        filename: Optional[str] = None,
+    ) -> Path:
         params = {"kind": kind}
         if run_id:
             params["run_id"] = run_id
+        if filename:
+            params["filename"] = filename
         resp = self._request("GET", f"/books/{book_id}/download", params=params, stream=True)
         filename = resp.headers.get("content-disposition")
         if filename and "filename=" in filename:
@@ -203,7 +212,13 @@ def handle_download(client: BackendClient, book: Dict, download_dir: Path) -> No
     entry = exports[idx - 1]
     run_id = entry.get("run_id") or None
     destination = download_dir / entry["name"]
-    path = client.download_artifact(book["id"], entry["kind"], destination, run_id=run_id)
+    path = client.download_artifact(
+        book["id"],
+        entry["kind"],
+        destination,
+        run_id=run_id,
+        filename=entry["name"],
+    )
     print(f"Scaricato in: {path}")
 
 

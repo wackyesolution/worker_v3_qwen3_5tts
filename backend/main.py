@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import secrets
 import shutil
@@ -29,12 +30,19 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from ebooklib import epub
+import torch
+from chatterbox.tts import ChatterboxTTS
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 from core import (
     find_document_chapters_and_extract_texts,
     find_good_chapters,
     extract_pdf_chapters,
     chapter_beginning_one_liner,
+    get_nlp,
+    gen_audio_segments,
+    write_audio_stream,
+    sample_rate,
 )
 
 
@@ -45,12 +53,14 @@ USERS_ROOT = BACKEND_ROOT / "users"
 LOGS_DIR = BACKEND_ROOT / "logs"
 PRE_SERVER = PROJECT_ROOT / "preServer.py"
 COLLECTION_DIR = PROJECT_ROOT / "audioBook"
+AUDIO_PROVE_DIR = PROJECT_ROOT / "audioProve"
 MAX_LOG_LINES = 10000
 
 SUPPORTED_EXTS = {".pdf", ".epub"}
 RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}$")
 ARTIFACT_KINDS = {
     ".wav": "wav",
+    ".m4a": "wav",
     ".srt": "srt",
     ".vtt": "vtt",
     ".pdf": "ebook",
@@ -66,6 +76,8 @@ ADMIN_PASSWORD = "admin"
 app = FastAPI(title="Chatterblez Backend", version="1.0.0")
 security = HTTPBasic()
 service_lock = threading.Lock()
+preview_lock = threading.Lock()
+tts_cache: Dict[str, Any] = {"mono": None, "multi": None}
 CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
 
@@ -75,9 +87,23 @@ class ProcessOptions(BaseModel):
     selected_chapters: Optional[List[int]] = None
 
 
+class VoiceTestRequest(BaseModel):
+    text: str
+    repetition_penalty: float = 1.1
+    min_p: float = 0.02
+    top_p: float = 0.95
+    exaggeration: float = 0.4
+    cfg_weight: float = 0.8
+    temperature: float = 0.85
+    speed: float = 1.0
+    use_multilingual: bool = False
+    language_id: str = "en"
+
+
 def ensure_backend_layout() -> None:
     USERS_ROOT.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIO_PROVE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def init_db() -> None:
@@ -204,6 +230,57 @@ def list_exports(book_id: int, export_dir: Path) -> List[Dict[str, str]]:
             }
         )
     return exports
+
+
+def get_tts_model(use_multilingual: bool):
+    key = "multi" if use_multilingual else "mono"
+    model = tts_cache.get(key)
+    if model is not None:
+        return model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if use_multilingual:
+        model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+    else:
+        model = ChatterboxTTS.from_pretrained(device=device)
+    tts_cache[key] = model
+    return model
+
+
+def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
+    text = (payload.text or "").strip()
+    if len(text) < 5:
+        raise HTTPException(status_code=400, detail="Inserisci almeno qualche parola da leggere.")
+    slug = slugify(user["username"])
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = AUDIO_PROVE_DIR / f"{slug}_{run_id}.wav"
+    model = get_tts_model(payload.use_multilingual)
+    nlp = get_nlp()
+
+    chunks = gen_audio_segments(
+        model,
+        nlp,
+        text,
+        payload.speed,
+        stats=None,
+        max_sentences=None,
+        post_event=None,
+        should_stop=lambda: False,
+        repetition_penalty=payload.repetition_penalty,
+        min_p=payload.min_p,
+        top_p=payload.top_p,
+        exaggeration=payload.exaggeration,
+        cfg_weight=payload.cfg_weight,
+        temperature=payload.temperature,
+        use_multilingual=payload.use_multilingual,
+        language_id=payload.language_id,
+        audio_prompt_wav=None,
+        sentence_gap_ms=0,
+        question_gap_ms=0,
+    )
+    frames = write_audio_stream(output_path, chunks)
+    if frames <= 0:
+        raise HTTPException(status_code=500, detail="Sintesi non riuscita, nessun audio generato.")
+    return output_path
 
 
 def describe_book(row: sqlite3.Row, export_dir: Path) -> Dict:
@@ -441,7 +518,12 @@ def get_book_chapters(book_id: int, user: Dict = Depends(get_current_user)):
     }
 
 
-def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None, selected_chapter_indices: Optional[List[int]] = None) -> Dict:
+def run_pipeline(
+    book: sqlite3.Row,
+    user: Dict,
+    filterlist: Optional[str] = None,
+    selected_chapter_indices: Optional[List[int]] = None,
+) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     import_path = Path(book["import_path"])
     if not import_path.exists():
@@ -469,6 +551,7 @@ def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None
                 continue
         if indices:
             cmd += ["--chapter-indices", ",".join(indices)]
+    cmd.append("--per-chapter-export")
     job_info = {
         "book_id": book["id"],
         "book_title": book["title"],
@@ -502,34 +585,51 @@ def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None
         )
 
     final_folder = COLLECTION_DIR / slug
-    wav = final_folder / f"{slug}_{run_id}.wav"
-    srt = final_folder / f"{slug}_{run_id}.srt"
-    vtt = final_folder / f"{slug}_{run_id}.vtt"
     ebook_copy = final_folder / f"{slug}_{run_id}{import_path.suffix.lower()}"
 
-    missing = [
-        path.name
-        for path in (wav, srt, vtt)
-        if not path.exists()
-    ]
-    if missing:
+    export_dir = user["folders"]["export"]
+    artifacts: List[Dict[str, str]] = []
+    chapter_audio = sorted(final_folder.glob(f"{slug}_{run_id}_chapter*.m4a"))
+    if not chapter_audio:
         raise HTTPException(
             status_code=500,
-            detail=f"File mancanti dopo la conversione: {', '.join(missing)}",
+            detail="Nessun file per capitolo trovato dopo la conversione.",
         )
+    chapter_count = len(chapter_audio)
+    for idx, audio_file in enumerate(chapter_audio, start=1):
+        chapter_suffix = f"_chapter{idx:03d}"
+        dest_audio = export_dir / f"book_{book['id']}_{run_id}{chapter_suffix}{audio_file.suffix.lower()}"
+        shutil.copy2(audio_file, dest_audio)
+        artifacts.append({"kind": "wav", "path": str(dest_audio), "chapter": idx})
+        srt_file = audio_file.with_suffix(".srt")
+        if srt_file.exists():
+            dest_srt = export_dir / f"book_{book['id']}_{run_id}{chapter_suffix}.srt"
+            shutil.copy2(srt_file, dest_srt)
+            artifacts.append({"kind": "srt", "path": str(dest_srt), "chapter": idx})
+        vtt_file = audio_file.with_suffix(".vtt")
+        if vtt_file.exists():
+            dest_vtt = export_dir / f"book_{book['id']}_{run_id}{chapter_suffix}.vtt"
+            shutil.copy2(vtt_file, dest_vtt)
+            artifacts.append({"kind": "vtt", "path": str(dest_vtt), "chapter": idx})
 
-    export_dir = user["folders"]["export"]
-    artifacts = []
-    for source in (wav, srt, vtt, ebook_copy if ebook_copy.exists() else None):
-        if not source:
-            continue
-        suffix = source.suffix.lower()
-        kind = ARTIFACT_KINDS.get(suffix)
-        if not kind:
-            continue
-        destination = export_dir / f"book_{book['id']}_{run_id}{suffix}"
-        shutil.copy2(source, destination)
-        artifacts.append({"kind": kind, "path": str(destination)})
+    final_m4a = final_folder / f"{slug}_{run_id}.m4a"
+    final_wav = final_folder / f"{slug}_{run_id}.wav"
+    final_srt = final_folder / f"{slug}_{run_id}.srt"
+    final_vtt = final_folder / f"{slug}_{run_id}.vtt"
+    for final_asset in (final_m4a, final_wav, final_srt, final_vtt):
+        if final_asset.exists():
+            suffix = final_asset.suffix.lower()
+            kind = ARTIFACT_KINDS.get(suffix)
+            if not kind:
+                continue
+            target = export_dir / f"book_{book['id']}_{run_id}{suffix}"
+            shutil.copy2(final_asset, target)
+            artifacts.append({"kind": kind, "path": str(target)})
+
+    if ebook_copy.exists():
+        ebook_dest = export_dir / f"book_{book['id']}_{run_id}{ebook_copy.suffix.lower()}"
+        shutil.copy2(ebook_copy, ebook_dest)
+        artifacts.append({"kind": "ebook", "path": str(ebook_dest)})
 
     with get_connection() as conn:
         conn.execute(
@@ -546,6 +646,8 @@ def run_pipeline(book: sqlite3.Row, user: Dict, filterlist: Optional[str] = None
 
     return {
         "run_id": run_id,
+        "mode": "per_chapter",
+        "chapter_count": chapter_count,
         "artifacts": artifacts,
         "stdout": log_excerpt,
         "log_path": str(log_path),
@@ -582,7 +684,12 @@ def process_book(
                     continue
             if cleaned:
                 selected_indices = cleaned
-        job_state = run_pipeline(book, user, filterlist=filterlist, selected_chapter_indices=selected_indices)
+        job_state = run_pipeline(
+            book,
+            user,
+            filterlist=filterlist,
+            selected_chapter_indices=selected_indices,
+        )
     finally:
         set_user_in_use(user["id"], False)
         if acquired:
@@ -627,12 +734,22 @@ def download_artifact(
     book_id: int,
     kind: str = Query(..., description="wav/srt/vtt/ebook/vst"),
     run_id: Optional[str] = Query(None),
+    filename: Optional[str] = Query(None),
     user: Dict = Depends(get_current_user),
 ):
     kind = kind.lower()
     require_book_owner(book_id, user["id"])
     export_dir = user["folders"]["export"]
-    path = resolve_export_path(book_id, run_id, kind, export_dir)
+    if filename:
+        sanitized = Path(filename).name
+        if not sanitized.startswith(f"book_{book_id}_"):
+            raise HTTPException(status_code=400, detail="Filename non valido per questo libro.")
+        path = (export_dir / sanitized).resolve()
+        base = export_dir.resolve()
+        if not str(path).startswith(str(base)) or not path.exists():
+            raise HTTPException(status_code=404, detail="File richiesto non trovato.")
+    else:
+        path = resolve_export_path(book_id, run_id, kind, export_dir)
     return FileResponse(path, filename=path.name)
 
 
@@ -676,6 +793,54 @@ def delete_book_exports(
     require_book_owner(book_id, user["id"])
     removed = delete_exports(book_id, user["folders"]["export"], run_id=run_id)
     return {"book_id": book_id, "removed": removed}
+
+
+@app.post("/voice-test")
+def voice_test(
+    payload: VoiceTestRequest,
+    user: Dict = Depends(get_current_user),
+):
+    acquired = preview_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(status_code=409, detail="È già in corso una generazione di prova.")
+    try:
+        audio_path = synthesize_voice_preview(payload, user)
+    finally:
+        if acquired:
+            preview_lock.release()
+    return FileResponse(audio_path, filename=audio_path.name)
+
+
+@app.get("/example/useTest")
+def example_use_test():
+    sample_payload = {
+        "text": "Ciao! Questa è una prova veloce della tua voce virtuale.",
+        "repetition_penalty": 1.05,
+        "min_p": 0.02,
+        "top_p": 0.92,
+        "exaggeration": 0.4,
+        "cfg_weight": 0.32,
+        "temperature": 0.9,
+        "speed": 0.95,
+        "use_multilingual": True,
+        "language_id": "it",
+    }
+    curl_example = (
+        "curl -u admin:admin "
+        "-H 'Content-Type: application/json' "
+        "-X POST http://localhost:8000/voice-test "
+        f"-d '{json.dumps(sample_payload)}' --output prova.wav"
+    )
+    return {
+        "endpoint": "/voice-test",
+        "method": "POST",
+        "authentication": "HTTP Basic",
+        "content_type": "application/json",
+        "sample_payload": sample_payload,
+        "ios_hint": "Invia il JSON via fetch/axios e salva il body della risposta (audio/wav) sul dispositivo.",
+        "curl_example": curl_example,
+        "response_description": "Restituisce un file WAV con la frase sintetizzata usando i parametri indicati.",
+    }
 
 
 if __name__ == "__main__":

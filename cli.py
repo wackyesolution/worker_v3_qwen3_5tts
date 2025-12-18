@@ -21,6 +21,11 @@ def cli_main():
     parser.add_argument('--filterlist', help='Comma-separated list of chapter names to ignore (case-insensitive substring match)')
     parser.add_argument('--chapter-indices', help='Comma-separated chapter indexes to include (0-based).')
     parser.add_argument('--wav', help='Path to a WAV file for voice conditioning (audio prompt)')
+    parser.add_argument(
+        '--per-chapter-export',
+        action='store_true',
+        help='Generate standalone audio files for each chapter instead of a single audiobook.'
+    )
     parser.add_argument('--speed', type=float, default=1.0, help='Speech speed (default: 1.0)')
     parser.add_argument('--cuda', default=True, help='Use GPU via Cuda in Torch if available', action='store_true')
 
@@ -136,6 +141,7 @@ def cli_main():
             language_id=args.language_id,
             disable_alignment_guard=args.disable_alignment_guard,
             selected_chapter_indices=chapter_indices,
+            per_chapter_export=args.per_chapter_export,
         )
     # Single file mode
     elif args.file:
@@ -169,6 +175,7 @@ def cli_main():
             language_id=args.language_id,
             disable_alignment_guard=args.disable_alignment_guard,
             selected_chapter_indices=chapter_indices,
+            per_chapter_export=args.per_chapter_export,
         )
     elapsed_time = time.time() - start_time
     logging.info(f"Script finished in {elapsed_time:.2f} seconds")

@@ -8,16 +8,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, List, Sequence, Union
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BOOK_DIR = SCRIPT_DIR / "DD_book"
 OUTPUT_BASE = SCRIPT_DIR / "DD_Output"
 COLLECTION_DIR = SCRIPT_DIR / "audioBook"
+CHAPTER_MANIFEST = "chapter_exports.json"
 
 # Settings mirrored from convert_tzone.sh
 CLI_ARGUMENTS = (
@@ -86,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated indexes of chapters to include during synthesis.",
     )
     parser.add_argument(
+        "--per-chapter-export",
+        action="store_true",
+        help="Generate standalone files per chapter instead of a single audiobook.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -111,7 +119,13 @@ def ensure_directories(*directories: Path) -> None:
         Path(directory).mkdir(parents=True, exist_ok=True)
 
 
-def build_cli_command(book_path: Path, output_dir: Path, filterlist: str | None = None, chapter_indices: str | None = None) -> List[str]:
+def build_cli_command(
+    book_path: Path,
+    output_dir: Path,
+    filterlist: str | None = None,
+    chapter_indices: str | None = None,
+    per_chapter_export: bool = False,
+) -> List[str]:
     cmd = [
         sys.executable,
         str(SCRIPT_DIR / "cli.py"),
@@ -125,6 +139,8 @@ def build_cli_command(book_path: Path, output_dir: Path, filterlist: str | None 
         cmd += ["--filterlist", filterlist]
     if chapter_indices:
         cmd += ["--chapter-indices", chapter_indices]
+    if per_chapter_export:
+        cmd.append("--per-chapter-export")
     return cmd
 
 
@@ -161,6 +177,56 @@ def convert_to_wav(source_file: Path, destination_file: Path) -> None:
     subprocess.run(ffmpeg_cmd, check=True)
 
 
+def convert_to_m4a(source_file: Path, destination_file: Path, bitrate: str = "96k") -> None:
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-i",
+        str(source_file),
+        "-c:a",
+        "aac",
+        "-b:a",
+        bitrate,
+        str(destination_file),
+    ]
+    logging.info("Converting %s to M4A (%s).", source_file.name, destination_file.name)
+    subprocess.run(ffmpeg_cmd, check=True)
+
+
+def concat_audio_files(audio_paths: List[Path], destination_file: Path) -> None:
+    if not audio_paths:
+        raise RuntimeError("Nessun file audio per la concatenazione.")
+    temp_list = destination_file.with_suffix(destination_file.suffix + ".txt")
+    with temp_list.open("w", encoding="utf-8") as handle:
+        for path in audio_paths:
+            safe_path = str(path).replace("'", "'\\''")
+            handle.write(f"file '{safe_path}'\n")
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(temp_list),
+        "-c:a",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        "24000",
+        str(destination_file),
+    ]
+    logging.info("Concatenating %d capitoli in %s", len(audio_paths), destination_file.name)
+    try:
+        subprocess.run(ffmpeg_cmd, check=True)
+    finally:
+        temp_list.unlink(missing_ok=True)
+
+
 def load_whisper_model(model_name: str):
     try:
         import torch  # type: ignore
@@ -177,6 +243,24 @@ def load_whisper_model(model_name: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info("Loading Whisper model '%s' on %s.", model_name, device)
     return whisper.load_model(model_name, device=device)
+
+
+def transcribe_segments(model, audio_path: Path, language: str):
+    language_hint = language or None
+    result = model.transcribe(str(audio_path), language=language_hint, verbose=False)
+    segments = result.get("segments", [])
+    if not segments:
+        raise RuntimeError(f"Whisper non ha prodotto segmenti per {audio_path}.")
+    simplified = []
+    for segment in segments:
+        simplified.append(
+            {
+                "text": segment.get("text", "").strip(),
+                "start": float(segment.get("start", 0.0)),
+                "end": float(segment.get("end", 0.0)),
+            }
+        )
+    return simplified
 
 
 def format_timestamp(seconds: float, delimiter: str) -> str:
@@ -212,14 +296,30 @@ def write_vtt(segments, destination: Path) -> None:
 def run_whisper(audio_path: Path, model_name: str, language: str, srt_path: Path, vtt_path: Path) -> None:
     model = load_whisper_model(model_name)
     logging.info("Transcribing %s with Whisper...", audio_path.name)
-    language_hint = language or None
-    result = model.transcribe(str(audio_path), language=language_hint, verbose=False)
-    segments = result.get("segments", [])
-    if not segments:
-        raise RuntimeError("Whisper did not return any segments.")
+    segments = transcribe_segments(model, audio_path, language)
     write_srt(segments, srt_path)
     write_vtt(segments, vtt_path)
     logging.info("Transcription complete. Files saved to %s and %s.", srt_path.name, vtt_path.name)
+
+
+def probe_duration_seconds(audio_path: Path) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    try:
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
+        return float(output)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Impossibile ottenere la durata di {audio_path}: {exc.output}") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"Durata non valida per {audio_path}: {output}") from exc
 
 
 def process_book(
@@ -232,7 +332,8 @@ def process_book(
     run_id: str | None = None,
     filterlist: str | None = None,
     chapter_indices: str | None = None,
-) -> dict[str, Path | str | None]:
+    per_chapter_export: bool = False,
+) -> Dict[str, Union[Path, str, None]]:
     book_path = resolve_book_path(str(book))
     book_basename = book_path.stem
     run_token = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -242,13 +343,93 @@ def process_book(
     output_dir = output_base / f"{book_basename}_{run_token}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cli_command = build_cli_command(book_path, output_dir, filterlist, chapter_indices)
+    cli_command = build_cli_command(
+        book_path,
+        output_dir,
+        filterlist,
+        chapter_indices,
+        per_chapter_export=per_chapter_export,
+    )
     run_cli(cli_command)
-
-    generated_m4b = find_generated_file(output_dir, "*.m4b", "final M4B file")
 
     final_folder = collect_dir / book_basename
     final_folder.mkdir(parents=True, exist_ok=True)
+    if per_chapter_export:
+        manifest_path = output_dir / CHAPTER_MANIFEST
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Chapter manifest not found at {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entries = manifest.get("chapters") or []
+        if not entries:
+            raise RuntimeError("Chapter manifest is empty; no per-chapter exports detected.")
+        saved_chapters: List[Dict[str, Union[Path, int, str, None]]] = []
+        chapter_audio_paths: List[Path] = []
+        combined_segments: List[Dict[str, Union[str, float]]] = []
+        offset_seconds = 0.0
+        whisper_model_instance = None if skip_transcription else load_whisper_model(whisper_model)
+        for entry in sorted(entries, key=lambda item: item.get("sequence", 0)):
+            source = Path(entry.get("audio_path", "")).expanduser()
+            if not source.exists():
+                raise FileNotFoundError(f"Per-chapter audio not found: {source}")
+            sequence = int(entry.get("sequence") or (len(saved_chapters) + 1))
+            dest_name = f"{book_basename}_{run_token}_chapter{sequence:03d}{source.suffix}"
+            dest_path = final_folder / dest_name
+            shutil.copy2(source, dest_path)
+            chapter_audio_paths.append(dest_path)
+            if whisper_model_instance:
+                segments = transcribe_segments(whisper_model_instance, dest_path, whisper_language)
+                for segment in segments:
+                    combined_segments.append(
+                        {
+                            "text": segment.get("text", ""),
+                            "start": segment.get("start", 0.0) + offset_seconds,
+                            "end": segment.get("end", 0.0) + offset_seconds,
+                        }
+                    )
+            offset_seconds += probe_duration_seconds(dest_path)
+            saved_chapters.append(
+                {
+                    "sequence": sequence,
+                    "chapter_index": entry.get("chapter_index"),
+                    "chapter_name": entry.get("chapter_name"),
+                    "audio": dest_path,
+                    "srt": None,
+                    "vtt": None,
+                }
+            )
+        merged_wav = final_folder / f"{book_basename}_{run_token}.wav"
+        concat_audio_files(chapter_audio_paths, merged_wav)
+        merged_m4a = final_folder / f"{book_basename}_{run_token}.m4a"
+        convert_to_m4a(merged_wav, merged_m4a)
+        srt_path = None
+        vtt_path = None
+        if not skip_transcription:
+            if not combined_segments:
+                raise RuntimeError("Nessun segmento Whisper raccolto nonostante la trascrizione sia attiva.")
+            srt_path = final_folder / f"{book_basename}_{run_token}.srt"
+            vtt_path = final_folder / f"{book_basename}_{run_token}.vtt"
+            write_srt(combined_segments, srt_path)
+            write_vtt(combined_segments, vtt_path)
+        else:
+            logging.info("Transcription skipped per flag.")
+        logging.info(
+            "Exported %d per-chapter audio files into %s e generato audio unico %s",
+            len(saved_chapters),
+            final_folder,
+            merged_m4a.name,
+        )
+        return {
+            "folder": final_folder,
+            "chapters": saved_chapters,
+            "wav": merged_wav,
+            "m4a": merged_m4a,
+            "srt": srt_path,
+            "vtt": vtt_path,
+            "run_id": run_token,
+        }
+
+    generated_m4b = find_generated_file(output_dir, "*.m4b", "final M4B file")
+
     wav_target = final_folder / f"{book_basename}_{run_token}.wav"
     convert_to_wav(generated_m4b, wav_target)
 
@@ -287,6 +468,7 @@ def main() -> None:
         run_id=args.run_id,
         filterlist=args.filterlist,
         chapter_indices=args.chapter_indices,
+        per_chapter_export=args.per_chapter_export,
     )
     logging.info("Run %s finished. Assets: %s", outputs["run_id"], outputs["folder"])
 
