@@ -35,6 +35,8 @@ import queue  # Import queue for concurrent reading
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from PyPDF2 import PdfReader
+import tempfile
+import shlex
 try:
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 except ImportError:
@@ -81,6 +83,9 @@ TTS_ENGINE = os.getenv("CHATTERBLEZ_TTS_ENGINE", "chatterbox").strip().lower()
 AZZURRA_MODEL_ID = os.getenv("CHATTERBLEZ_AZZURRA_MODEL", "cartesia/azzurra-voice")
 _AZZURRA_CACHE: Dict[str, Any] = {"processor": None, "model": None, "device": None}
 _TTS_RESOURCE_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
+CSM_BINARY = os.getenv("CHATTERBLEZ_CSM_BINARY", "csm.rs")
+CSM_MODEL_ID = os.getenv("CHATTERBLEZ_CSM_MODEL", "cartesia/azzurra-voice")
+CSM_EXTRA_ARGS = os.getenv("CHATTERBLEZ_CSM_EXTRA_ARGS", "")
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -173,8 +178,15 @@ def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_s
     logging.info(f"Removed silence: {removed_time:.2f}s ({removed_time / original_duration * 100:.1f}%)")
 
 
-def get_tts_engine_name() -> str:
+def _resolve_tts_engine() -> str:
+    env_value = os.getenv("CHATTERBLEZ_TTS_ENGINE")
+    if env_value:
+        return env_value.strip().lower()
     return TTS_ENGINE
+
+
+def get_tts_engine_name() -> str:
+    return _resolve_tts_engine()
 
 
 def ensure_azzurra_available() -> None:
@@ -227,12 +239,29 @@ def load_chatterbox_resources(use_multilingual: bool) -> Dict[str, Any]:
     }
 
 
+def load_csm_resources() -> Dict[str, Any]:
+    if shutil.which(CSM_BINARY) is None:
+        raise RuntimeError(
+            f"Impossibile trovare il binario '{CSM_BINARY}'. "
+            "Installa csm.rs e imposta CHATTERBLEZ_CSM_BINARY se necessario."
+        )
+    return {
+        "engine": "csm",
+        "binary": CSM_BINARY,
+        "model_id": CSM_MODEL_ID,
+        "extra_args": CSM_EXTRA_ARGS,
+    }
+
+
 def load_tts_resources(use_multilingual: bool, cache: bool = False) -> Dict[str, Any]:
-    key = (TTS_ENGINE, use_multilingual)
+    engine = get_tts_engine_name()
+    key = (engine, use_multilingual)
     if cache and key in _TTS_RESOURCE_CACHE:
         return _TTS_RESOURCE_CACHE[key]
-    if TTS_ENGINE == "azzurra":
+    if engine == "azzurra":
         resources = load_azzurra_resources()
+    elif engine == "csm":
+        resources = load_csm_resources()
     else:
         resources = load_chatterbox_resources(use_multilingual)
     if cache:
@@ -258,6 +287,44 @@ def synthesize_with_azzurra(tts_resources: Dict[str, Any], text: str, temperatur
     audio_output = model.generate(**inputs, output_audio=True, **generation_kwargs)
     waveform = audio_output[0].to("cpu").numpy()
     return waveform
+
+
+def synthesize_with_csm(
+    tts_resources: Dict[str, Any], text: str, *, temperature: float | None = None
+) -> np.ndarray:
+    binary = tts_resources["binary"]
+    model_id = tts_resources["model_id"]
+    extra = tts_resources.get("extra_args") or ""
+    extra_args = shlex.split(extra)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_file = tmp_path / "output.wav"
+        cmd = [
+            binary,
+            "--model-id",
+            model_id,
+            "--text",
+            text,
+            "--output",
+            str(output_file),
+        ]
+        if temperature is not None:
+            cmd.extend(["--temperature", f"{float(temperature):.6f}"])
+        cmd.extend(extra_args)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Il processo csm.rs è terminato con errore:\n"
+                f"{result.stdout}\n{result.stderr}"
+            )
+        if not output_file.exists():
+            raise RuntimeError("csm.rs non ha prodotto il file audio atteso.")
+        data, sr = soundfile.read(output_file)
+        if sr != sample_rate:
+            logging.warning(
+                "Sample rate inatteso da csm.rs (%s). Atteso: %s", sr, sample_rate
+            )
+        return np.asarray(data, dtype=np.float32).flatten()
 
 
 import string
@@ -1042,6 +1109,13 @@ def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentence
                 temperature=temperature,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
+            )
+            yield wav_array
+        elif engine == "csm":
+            wav_array = synthesize_with_csm(
+                tts_resources,
+                batch_text,
+                temperature=temperature,
             )
             yield wav_array
         elif use_multilingual:

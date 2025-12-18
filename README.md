@@ -92,6 +92,38 @@ Lo script esegue automaticamente `apt update && apt upgrade -y && apt install -y
 
 Questo setup assume **Python 3.11.9** e i binari PyTorch/cu124 **2.4.0** del template.
 
+#### 🔁 Setup alternativo “solo backend” + Cartesia Azzurra
+
+Se vuoi far girare esclusivamente l’API FastAPI (senza PyQt/Gradio/Chatterbox) per sfruttare il motore **Cartesia Azzurra** o il binario **csm.rs**, usa la coppia `requirements_azzurra.txt` + `install_azzurra.sh`:
+
+```bash
+./install_azzurra.sh                    # crea .venv-azzurra e installa solo le dipendenze del backend
+source .venv-azzurra/bin/activate
+```
+
+Questo ambiente installa `transformers` direttamente dal repo Hugging Face (serve per `CsmForConditionalGeneration`) ma lascia fuori `chatterbox`, `gradio`, `PyQt` e tutte le altre librerie che creavano conflitti.
+
+Per prestazioni massime con Azzurra consigliamo di usare il binario Rust [`csm.rs`](https://github.com/cartesia-one/csm.rs) (GPU/CPU) e lasciare che Python gestisca solo lo split dei capitoli + Whisper. Dopo aver compilato `csm.rs` (`cargo build --release --features cuda`, oppure `--features mkl/accelerate`), punta l’ambiente alle sue opzioni:
+
+```bash
+# Carica il binario nativo e modello da Hugging Face o locale
+export CHATTERBLEZ_TTS_ENGINE=csm
+export CHATTERBLEZ_CSM_BINARY=/percorso/al/tuo/csm.rs        # es. ./target/release/main
+export CHATTERBLEZ_CSM_MODEL=cartesia/azzurra-voice
+# opzionale: --cpu / --model-file q8.gguf / --speaker-id ecc.
+export CHATTERBLEZ_CSM_EXTRA_ARGS="--cpu --temperature 0.85"
+```
+
+Hai già pronto uno script rapido per testare la voce senza lanciare tutto FastAPI:
+
+```bash
+CHATTERBLEZ_TTS_ENGINE=csm \
+CHATTERBLEZ_CSM_BINARY=/percorso/al/tuo/csm.rs \
+python quick_tts_test.py --text "Ciao! Questa è una prova." --output prova.wav
+```
+
+Quando vuoi tornare al flusso tradizionale con Chatterbox basta usare l’altra virtualenv o impostare `CHATTERBLEZ_TTS_ENGINE=chatterbox`.
+
 #### 🕹️ Avvio guidato (Runpod friendly)
 
 Usa il nuovo launcher interattivo per convertire rapidamente i libri dalla cartella `DD_book` o per fare un test vocalico di ~30 secondi con il tuo timbro:
@@ -154,6 +186,22 @@ ffmpeg -version
 ---
 
 ### 🚀 Usage (Coming Soon!)
+
+Puoi scegliere il motore di sintesi impostando la variabile `CHATTERBLEZ_TTS_ENGINE` prima di avviare FastAPI (`uvicorn backend.main:app --host 0.0.0.0 --port 7860`), `dd_launcher.py` o gli script di test:
+
+| Valore | Descrizione | Dipendenze principali |
+| --- | --- | --- |
+| `chatterbox` (default) | Motore Resemble-AI, supporta UI classica con timbro personale. | `install.sh` + `requirements.txt` + pacchetto `chatterbox`. |
+| `azzurra` | Usa direttamente `transformers`/`CsmForConditionalGeneration`. Richiede GPU con molta VRAM e la build bleeding-edge di `transformers`. | `install_azzurra.sh` oppure ambiente custom con `requirements_azzurra.txt`. |
+| `csm` | Delega la sintesi al binario Rust `csm.rs` (CPU/GPU) e riduce drasticamente la RAM del processo FastAPI. | Virtualenv “azzurra” (o equivalente) + binario `csm.rs` compilato. |
+
+Le opzioni del client non cambiano: dividiamo sempre il libro in capitoli, ogni capitolo in frasi, generiamo un file WAV per capitolo, lo convertiamo in M4A e solo alla fine concateneremo/traskriviemo tutto con Whisper. Lato server puoi controllare `csm.rs` tramite le variabili:
+
+* `CHATTERBLEZ_CSM_BINARY` – percorso del binario (`csm.rs`, `./target/release/main`, ecc.).
+* `CHATTERBLEZ_CSM_MODEL` – ID del modello Hugging Face o path locale.
+* `CHATTERBLEZ_CSM_EXTRA_ARGS` – argomenti aggiuntivi passati al CLI (`--cpu`, `--model-file q8.gguf`, `--speaker-id 4`, …).
+
+Per un controllo rapido (senza FastAPI) usa `quick_tts_test.py` con le stesse variabili d’ambiente. I parametri non supportati nativamente dal binario (es. `top_p`, `cfg_weight`, ecc.) vengono ignorati, così il client non deve cambiare nulla.
 
 Detailed usage instructions, including how to convert your first PDF or EPUB, will be added here shortly! Stay tuned! ⏳
 
