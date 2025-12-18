@@ -103,11 +103,77 @@ install_project_requirements() {
   run_pip install -r requirements_azzurra.txt
 }
 
+install_csm_rs() {
+  if [[ "${INSTALL_CSM_RS:-1}" != "1" ]]; then
+    banner "Skipping csm.rs build (INSTALL_CSM_RS!=1)"
+    return
+  fi
+
+  local build_dir=${CSM_BUILD_DIR:-csm.rs}
+  local repo=${CSM_REPO:-https://github.com/cartesia-one/csm.rs}
+  local binary_name=${CSM_BINARY_NAME:-main}
+  local features=${CSM_FEATURES:-cuda}
+  local cargo_bin=${CARGO_BIN:-cargo}
+
+  banner "Ensuring pkg-config and OpenSSL headers are installed"
+  if command -v apt >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
+    local apt_cmd="apt"
+    command -v apt-get >/dev/null 2>&1 && apt_cmd="apt-get"
+    if [[ $EUID -ne 0 ]]; then
+      echo "pkg-config/libssl-dev install requires root. Run with sudo or set INSTALL_CSM_RS=0." >&2
+      exit 1
+    fi
+    $apt_cmd update
+    $apt_cmd install -y pkg-config libssl-dev
+  else
+    echo "pkg-config/libssl-dev install skipped (apt not available). Install them manually if missing." >&2
+  fi
+
+  if ! command -v "$cargo_bin" >/dev/null 2>&1; then
+    echo "Cargo non trovato. Installa Rust (curl https://sh.rustup.rs | sh) o imposta CARGO_BIN." >&2
+    exit 1
+  fi
+
+  banner "Building csm.rs ($features)"
+  if [[ ! -d "$build_dir/.git" ]]; then
+    rm -rf "$build_dir"
+    git clone "$repo" "$build_dir"
+  else
+    git -C "$build_dir" pull --ff-only
+  fi
+  pushd "$build_dir" >/dev/null
+  "$cargo_bin" build --release --features "$features"
+  popd >/dev/null
+
+  local binary_path="$build_dir/target/release/$binary_name"
+  if [[ ! -f "$binary_path" ]]; then
+    echo "Compilazione csm.rs completata ma binario '$binary_path' mancante." >&2
+    exit 1
+  fi
+  local resolved_binary
+  resolved_binary=$(realpath "$binary_path")
+  local env_file=${CSM_ENV_FILE:-.azzurra-env}
+  cat >"$env_file" <<EOF
+# Source this file to use the Cartesia engine with FastAPI/CLI
+export CHATTERBLEZ_TTS_ENGINE=csm
+export CHATTERBLEZ_CSM_BINARY=$resolved_binary
+export CHATTERBLEZ_CSM_MODEL=${CHATTERBLEZ_CSM_MODEL:-cartesia/azzurra-voice}
+# export CHATTERBLEZ_CSM_EXTRA_ARGS="--cpu"   # optional
+EOF
+  cat <<EOV
+
+[csm.rs]
+Binary path       : $resolved_binary
+Env helper file   : $env_file  (run: source $env_file)
+EOV
+}
+
 install_ffmpeg
 check_python
 setup_venv
 install_base_tools
 install_torch_stack
 install_project_requirements
+install_csm_rs
 
 banner "Azzurra environment ready! Activate with: source ${VENV_PATH}/bin/activate"
