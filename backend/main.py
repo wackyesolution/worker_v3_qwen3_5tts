@@ -14,7 +14,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import (
     Depends,
@@ -30,9 +30,6 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from ebooklib import epub
-import torch
-from chatterbox.tts import ChatterboxTTS
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 from core import (
     find_document_chapters_and_extract_texts,
@@ -44,6 +41,8 @@ from core import (
     write_audio_stream,
     sample_rate,
     clean_line,
+    load_tts_resources,
+    get_tts_engine_name,
 )
 
 
@@ -78,7 +77,7 @@ app = FastAPI(title="Chatterblez Backend", version="1.0.0")
 security = HTTPBasic()
 service_lock = threading.Lock()
 preview_lock = threading.Lock()
-tts_cache: Dict[str, Any] = {"mono": None, "multi": None}
+tts_cache: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
 
@@ -239,18 +238,15 @@ def list_exports(book_id: int, export_dir: Path) -> List[Dict[str, str]]:
     return exports
 
 
-def get_tts_model(use_multilingual: bool):
-    key = "multi" if use_multilingual else "mono"
-    model = tts_cache.get(key)
-    if model is not None:
-        return model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if use_multilingual:
-        model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-    else:
-        model = ChatterboxTTS.from_pretrained(device=device)
-    tts_cache[key] = model
-    return model
+def get_tts_resources_cached(use_multilingual: bool):
+    engine = get_tts_engine_name()
+    key = (engine, use_multilingual)
+    cached = tts_cache.get(key)
+    if cached is not None:
+        return cached
+    resources = load_tts_resources(use_multilingual=use_multilingual, cache=False)
+    tts_cache[key] = resources
+    return resources
 
 
 def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
@@ -267,11 +263,11 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
     slug = slugify(user["username"])
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = AUDIO_PROVE_DIR / f"{slug}_{run_id}.wav"
-    model = get_tts_model(payload.use_multilingual)
+    tts_resources = get_tts_resources_cached(payload.use_multilingual)
     nlp = get_nlp()
 
     chunks = gen_audio_segments(
-        model,
+        tts_resources,
         nlp,
         text,
         payload.speed,

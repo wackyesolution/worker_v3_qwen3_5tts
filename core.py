@@ -11,6 +11,7 @@ import sys
 import traceback
 from glob import glob
 
+import torch
 import torch.cuda
 import spacy
 import ebooklib
@@ -36,7 +37,14 @@ from pydub.silence import split_on_silence
 from PyPDF2 import PdfReader
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
+try:
+    from transformers import AutoProcessor, CsmForConditionalGeneration
+except ImportError:  # optional dependency used only for azzurra engine
+    AutoProcessor = None
+    CsmForConditionalGeneration = None
+
 from functools import lru_cache
+from typing import Any, Dict, Tuple
 
 _ALIGNMENT_GUARD_DISABLED = False
 
@@ -66,6 +74,10 @@ def disable_alignment_guard_checks():
 
 sample_rate = 24000
 CHAPTER_MANIFEST_FILENAME = "chapter_exports.json"
+TTS_ENGINE = os.getenv("CHATTERBLEZ_TTS_ENGINE", "chatterbox").strip().lower()
+AZZURRA_MODEL_ID = os.getenv("CHATTERBLEZ_AZZURRA_MODEL", "cartesia/azzurra-voice")
+_AZZURRA_CACHE: Dict[str, Any] = {"processor": None, "model": None, "device": None}
+_TTS_RESOURCE_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -156,6 +168,83 @@ def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_s
     logging.info(f"\nOriginal duration: {original_duration:.2f}s")
     logging.info(f"New duration: {new_duration:.2f}s")
     logging.info(f"Removed silence: {removed_time:.2f}s ({removed_time / original_duration * 100:.1f}%)")
+
+
+def get_tts_engine_name() -> str:
+    return TTS_ENGINE
+
+
+def ensure_azzurra_available() -> None:
+    if AutoProcessor is None or CsmForConditionalGeneration is None:
+        raise RuntimeError(
+            "Il motore Azzurra richiede il pacchetto 'transformers'. Installalo per usare CHATTERBLEZ_TTS_ENGINE=azzurra."
+        )
+
+
+def load_azzurra_resources() -> Dict[str, Any]:
+    ensure_azzurra_available()
+    if _AZZURRA_CACHE["model"] is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        processor = AutoProcessor.from_pretrained(AZZURRA_MODEL_ID)
+        model = CsmForConditionalGeneration.from_pretrained(AZZURRA_MODEL_ID).to(device)
+        _AZZURRA_CACHE["processor"] = processor
+        _AZZURRA_CACHE["model"] = model
+        _AZZURRA_CACHE["device"] = device
+    return {
+        "engine": "azzurra",
+        "processor": _AZZURRA_CACHE["processor"],
+        "model": _AZZURRA_CACHE["model"],
+        "device": _AZZURRA_CACHE["device"],
+    }
+
+
+def load_chatterbox_resources(use_multilingual: bool) -> Dict[str, Any]:
+    from chatterbox.tts import ChatterboxTTS
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if use_multilingual:
+        model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+    else:
+        model = ChatterboxTTS.from_pretrained(device=device)
+    return {
+        "engine": "chatterbox",
+        "model": model,
+        "device": device,
+        "use_multilingual": use_multilingual,
+    }
+
+
+def load_tts_resources(use_multilingual: bool, cache: bool = False) -> Dict[str, Any]:
+    key = (TTS_ENGINE, use_multilingual)
+    if cache and key in _TTS_RESOURCE_CACHE:
+        return _TTS_RESOURCE_CACHE[key]
+    if TTS_ENGINE == "azzurra":
+        resources = load_azzurra_resources()
+    else:
+        resources = load_chatterbox_resources(use_multilingual)
+    if cache:
+        _TTS_RESOURCE_CACHE[key] = resources
+    return resources
+
+
+def synthesize_with_azzurra(tts_resources: Dict[str, Any], text: str, temperature: float, top_p: float, repetition_penalty: float):
+    processor = tts_resources["processor"]
+    model = tts_resources["model"]
+    device = tts_resources["device"]
+    conversation = [{"role": "user", "content": [{"type": "text", "text": text}]}]
+    inputs = processor.apply_chat_template(
+        conversation,
+        tokenize=True,
+        return_dict=True,
+    ).to(device)
+    generation_kwargs = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "repetition_penalty": float(repetition_penalty),
+    }
+    audio_output = model.generate(**inputs, output_audio=True, **generation_kwargs)
+    waveform = audio_output[0].to("cpu").numpy()
+    return waveform
 
 
 import string
@@ -566,30 +655,23 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
     chapter_wav_files = []
     chapter_exports = []
 
-    import torchaudio as ta
-    from chatterbox.tts import ChatterboxTTS
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logging.info(f'running on device: {device}')
+    tts_resources = load_tts_resources(use_multilingual=use_multilingual, cache=False)
+    engine_name = tts_resources["engine"]
+    logging.info(f'Using TTS engine: {engine_name}')
 
-    if use_multilingual and disable_alignment_guard:
-        disable_alignment_guard_checks()
-
-    if use_multilingual:
-        cb_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+    if engine_name == "chatterbox":
+        if use_multilingual and disable_alignment_guard:
+            disable_alignment_guard_checks()
+        cb_model = tts_resources["model"]
+        if audio_prompt_wav:
+            try:
+                cb_model.prepare_conditionals(wav_fpath=audio_prompt_wav)
+            except AttributeError:
+                logging.debug("prepare_conditionals not available; relying on audio_prompt_path in generate()")
     else:
-        cb_model = ChatterboxTTS.from_pretrained(device=device)
-
-    # If a custom audio prompt is provided, use it
-    if audio_prompt_wav:
-        try:
-            cb_model.prepare_conditionals(wav_fpath=audio_prompt_wav)
-        except AttributeError:
-            # Some releases don't expose prepare_conditionals on the multilingual model,
-            # so we fall back to passing the prompt to generate().
-            logging.debug("prepare_conditionals not available; relying on audio_prompt_path in generate()")
-    # You must set AUDIO_PROMPT_PATH to the correct path for your audio prompt
-    # AUDIO_PROMPT_PATH = "audio_prompt.wav"  # <-- Set this to your actual prompt file
-    # cb_model.prepare_conditionals(wav_fpath=AUDIO_PROMPT_PATH)
+        if audio_prompt_wav:
+            logging.warning("Audio prompt non supportato con il motore Azzurra; verrà ignorato.")
+        cb_model = None  # Not used, kept for compatibility
 
     nlp = get_nlp()
     for i, chapter in enumerate(selected_chapters, start=1):
@@ -629,7 +711,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         if post_event and hasattr(chapter, "chapter_index"):
             post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_chunks = gen_audio_segments(
-            cb_model,
+            tts_resources,
             nlp,
             text,
             speed,
@@ -897,12 +979,15 @@ def convert_chapter_wav_to_m4a(source_path: Path) -> Path:
     return destination
 
 
-def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=None,
+def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentences=None,
                        post_event=None, should_stop=None, repetition_penalty=1.2, min_p=0.05, top_p=1.0, exaggeration=0.5, cfg_weight=0.5, temperature=0.8,
                        use_multilingual=False, language_id='en', audio_prompt_wav=None, sentence_gap_ms=0, question_gap_ms=0):  # Use spacy to split into sentences
 
     if should_stop is None:
         should_stop = lambda: False
+
+    engine = tts_resources.get("engine", "chatterbox")
+    cb_model = tts_resources.get("model")
 
     doc = nlp(text)
     sentences = list(doc.sents)
@@ -937,7 +1022,16 @@ def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=Non
             continue
 
 
-        if use_multilingual:
+        if engine == "azzurra":
+            wav_array = synthesize_with_azzurra(
+                tts_resources,
+                batch_text,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            yield wav_array
+        elif use_multilingual:
             wav = cb_model.generate(
                 batch_text,
                 language_id=language_id or 'en',
@@ -949,6 +1043,7 @@ def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=Non
                 cfg_weight=cfg_weight,
                 temperature=temperature
             )
+            yield wav.numpy().flatten()
         else:
             wav = cb_model.generate(
                 batch_text,
@@ -959,7 +1054,7 @@ def gen_audio_segments(cb_model, nlp, text, speed, stats=None, max_sentences=Non
                 cfg_weight=cfg_weight,
                 temperature=temperature
             )
-        yield wav.numpy().flatten()
+            yield wav.numpy().flatten()
 
         gap_duration = sentence_gap_ms
         if question_gap_ms > 0 and batch_text.rstrip().endswith('?'):
