@@ -43,6 +43,7 @@ from core import (
     gen_audio_segments,
     write_audio_stream,
     sample_rate,
+    clean_line,
 )
 
 
@@ -209,6 +210,12 @@ def set_user_in_use(user_id: int, flag: bool) -> None:
         conn.commit()
 
 
+def reset_all_users_in_use() -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE users SET in_use=0")
+        conn.commit()
+
+
 def list_exports(book_id: int, export_dir: Path) -> List[Dict[str, str]]:
     exports: List[Dict[str, str]] = []
     prefix = f"book_{book_id}_"
@@ -247,9 +254,16 @@ def get_tts_model(use_multilingual: bool):
 
 
 def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
-    text = (payload.text or "").strip()
-    if len(text) < 5:
+    text_lines = []
+    for line in (payload.text or "").splitlines():
+        cleaned = clean_line(line)
+        if cleaned:
+            text_lines.append(cleaned)
+    text = " ".join(text_lines).strip()
+    if not text:
         raise HTTPException(status_code=400, detail="Inserisci almeno qualche parola da leggere.")
+    if not text.endswith((".", "!", "?")):
+        text += "."
     slug = slugify(user["username"])
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = AUDIO_PROVE_DIR / f"{slug}_{run_id}.wav"
@@ -840,6 +854,52 @@ def example_use_test():
         "ios_hint": "Invia il JSON via fetch/axios e salva il body della risposta (audio/wav) sul dispositivo.",
         "curl_example": curl_example,
         "response_description": "Restituisce un file WAV con la frase sintetizzata usando i parametri indicati.",
+    }
+
+
+def kill_external_processes() -> Dict[str, bool]:
+    results: Dict[str, bool] = {}
+    pkill_exists = shutil.which("pkill")
+    if not pkill_exists:
+        results["pkill_available"] = False
+        return results
+    for target in ("ffmpeg", "preServer.py"):
+        try:
+            proc = subprocess.run(["pkill", "-f", target], check=False)
+            results[target] = proc.returncode == 0
+        except Exception:
+            results[target] = False
+    return results
+
+
+@app.post("/jobs/abort-all")
+def abort_all_jobs(user: Dict = Depends(get_current_user)):
+    global CURRENT_JOB, CURRENT_JOB_PROCESS
+    terminated = False
+    if CURRENT_JOB_PROCESS and CURRENT_JOB_PROCESS.poll() is None:
+        try:
+            CURRENT_JOB_PROCESS.terminate()
+            CURRENT_JOB_PROCESS.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                CURRENT_JOB_PROCESS.kill()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        terminated = True
+    CURRENT_JOB_PROCESS = None
+    CURRENT_JOB = None
+    cleanup = kill_external_processes()
+    reset_all_users_in_use()
+    try:
+        service_lock.release()
+    except RuntimeError:
+        pass
+    return {
+        "status": "aborted",
+        "terminated_current": terminated,
+        "external_cleanup": cleanup,
     }
 
 
