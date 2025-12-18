@@ -35,7 +35,10 @@ import queue  # Import queue for concurrent reading
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from PyPDF2 import PdfReader
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+try:
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+except ImportError:
+    ChatterboxMultilingualTTS = None
 
 try:
     from transformers import AutoProcessor, CsmForConditionalGeneration
@@ -199,7 +202,17 @@ def load_azzurra_resources() -> Dict[str, Any]:
 
 
 def load_chatterbox_resources(use_multilingual: bool) -> Dict[str, Any]:
-    from chatterbox.tts import ChatterboxTTS
+    try:
+        from chatterbox.tts import ChatterboxTTS
+    except ImportError as exc:
+        raise RuntimeError(
+            "Il motore Chatterbox non è installato in questo ambiente. "
+            "Installa chatterbox-tts oppure usa CHATTERBLEZ_TTS_ENGINE=azzurra."
+        ) from exc
+    if use_multilingual and ChatterboxMultilingualTTS is None:
+        raise RuntimeError(
+            "chatterbox.mtl_tts non è disponibile: installa chatterbox-tts per usare il motore multilingue."
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if use_multilingual:

@@ -1,0 +1,24 @@
+# Requirements for running the backend with the Azzurra voice engine.
+# They include all the base dependencies plus the bleeding-edge Transformers
+# build that exposes `CsmForConditionalGeneration`.
+# Minimal requirements for running the FastAPI backend with the Azzurra voice engine.
+# This list intentionally omits the Chatterbox stack (and gradio/PyQt) to avoid
+# dependency conflicts while keeping all components needed by backend/main.py.
+EbookLib==0.19
+en_core_web_trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.8.0/en_core_web_trf-3.8.0-py3-none-any.whl#sha256=272a31e9d8530d1e075351d30a462d7e80e31da23574f1b274e200f3fff35bf5
+spacy-curated-transformers==0.3.1
+PyPDF2==3.0.1
+llvmlite==0.41.1
+numba==0.58.1
+pydub
+spacy
+tabulate
+pick
+numpy==1.25.2
+beautifulsoup4==4.13.4
+soundfile
+openai-whisper
+fastapi
+uvicorn
+requests
+git+https://github.com/huggingface/transformers.git
