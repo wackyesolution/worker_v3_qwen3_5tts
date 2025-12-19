@@ -663,6 +663,18 @@ def run_pipeline(
             dest_vtt = export_dir / f"book_{book['id']}_{run_id}{chapter_suffix}.vtt"
             shutil.copy2(vtt_file, dest_vtt)
             artifacts.append({"kind": "vtt", "path": str(dest_vtt), "chapter": idx})
+    merged_candidates = {
+        "wav": final_folder / f"{slug}_{run_id}.wav",
+        "m4a": final_folder / f"{slug}_{run_id}.m4a",
+        "srt": final_folder / f"{slug}_{run_id}.srt",
+        "vtt": final_folder / f"{slug}_{run_id}.vtt",
+    }
+    for kind, source in merged_candidates.items():
+        if not source.exists():
+            continue
+        dest = export_dir / f"book_{book['id']}_{run_id}{source.suffix.lower()}"
+        shutil.copy2(source, dest)
+        artifacts.append({"kind": kind if kind != "m4a" else "wav", "path": str(dest)})
 
     final_m4a = final_folder / f"{slug}_{run_id}.m4a"
     final_wav = final_folder / f"{slug}_{run_id}.wav"
