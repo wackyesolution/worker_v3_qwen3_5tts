@@ -269,7 +269,14 @@ def load_tts_resources(use_multilingual: bool, cache: bool = False) -> Dict[str,
     return resources
 
 
-def synthesize_with_azzurra(tts_resources: Dict[str, Any], text: str, temperature: float, top_p: float, repetition_penalty: float):
+def synthesize_with_azzurra(
+    tts_resources: Dict[str, Any],
+    text: str,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+    top_k: int | None = None,
+):
     processor = tts_resources["processor"]
     model = tts_resources["model"]
     device = tts_resources["device"]
@@ -284,6 +291,8 @@ def synthesize_with_azzurra(tts_resources: Dict[str, Any], text: str, temperatur
         "top_p": float(top_p),
         "repetition_penalty": float(repetition_penalty),
     }
+    if top_k is not None:
+        generation_kwargs["top_k"] = int(top_k)
     audio_output = model.generate(**inputs, output_audio=True, **generation_kwargs)
     waveform = audio_output[0].to("cpu").numpy()
     return waveform
@@ -543,7 +552,7 @@ def clean_line(line: str) -> str:
     return line.strip()
 def main(file_path, pick_manually, speed, book_year='', output_folder='.',
          max_chapters=None, max_sentences=None, selected_chapters=None, selected_chapter_indices=None, post_event=None, audio_prompt_wav=None, batch_files=None, ignore_list=None, should_stop=None,
-         repetition_penalty=1.1, min_p=0.02, top_p=0.95, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
+         repetition_penalty=1.1, min_p=0.02, top_p=0.95, top_k=None, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
          enable_silence_trimming=False, silence_thresh=-50, min_silence_len=500, keep_silence=100,
          use_multilingual=False, language_id='en', sentence_gap_ms=0, question_gap_ms=0, disable_alignment_guard=False,
          per_chapter_export=False):
@@ -566,6 +575,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         "repetition_penalty":repetition_penalty,
         "min_p":min_p,
         "top_p":top_p,
+        "top_k":top_k,
         "exaggeration":exaggeration,
         "cfg_weight":cfg_weight,
         "temperature":temperature,
@@ -608,6 +618,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                top_k=top_k,
                 exaggeration=exaggeration,
                 cfg_weight=cfg_weight,
                 temperature=temperature,
@@ -1060,7 +1071,7 @@ def convert_chapter_wav_to_m4a(source_path: Path) -> Path:
 
 
 def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentences=None,
-                       post_event=None, should_stop=None, repetition_penalty=1.2, min_p=0.05, top_p=1.0, exaggeration=0.5, cfg_weight=0.5, temperature=0.8,
+                       post_event=None, should_stop=None, repetition_penalty=1.2, min_p=0.05, top_p=1.0, top_k=None, exaggeration=0.5, cfg_weight=0.5, temperature=0.8,
                        use_multilingual=False, language_id='en', audio_prompt_wav=None, sentence_gap_ms=0, question_gap_ms=0):  # Use spacy to split into sentences
 
     if should_stop is None:
@@ -1109,6 +1120,7 @@ def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentence
                 temperature=temperature,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
+                top_k=top_k,
             )
             yield wav_array
         elif engine == "csm":

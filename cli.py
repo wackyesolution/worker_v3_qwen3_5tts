@@ -39,6 +39,7 @@ def cli_main():
     parser.add_argument('--repetition-penalty', type=float, default=1.1, help='Repetition penalty (default: 1.1)')
     parser.add_argument('--min-p', type=float, default=0.02, help='Min P for sampling (default: 0.02)')
     parser.add_argument('--top-p', type=float, default=0.95, help='Top P for sampling (default: 0.95)')
+    parser.add_argument('--top-k', type=int, help='Top K for sampling (Azzurra only)')
     parser.add_argument('--exaggeration', type=float, default=0.4, help='Exaggeration factor (default: 0.4)')
     parser.add_argument('--cfg-weight', type=float, default=0.8, help='CFG weight (default: 0.8)')
     parser.add_argument('--temperature', type=float, default=0.85, help='Temperature for sampling (default: 0.85)')
@@ -128,6 +129,7 @@ def cli_main():
             repetition_penalty=args.repetition_penalty,
             min_p=args.min_p,
             top_p=args.top_p,
+            top_k=args.top_k,
             exaggeration=args.exaggeration,
             cfg_weight=args.cfg_weight,
             temperature=args.temperature,
@@ -162,6 +164,7 @@ def cli_main():
             repetition_penalty=args.repetition_penalty,
             min_p=args.min_p,
             top_p=args.top_p,
+            top_k=args.top_k,
             exaggeration=args.exaggeration,
             cfg_weight=args.cfg_weight,
             temperature=args.temperature,

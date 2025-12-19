@@ -29,6 +29,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a quick audio sample via the configured TTS engine.")
     parser.add_argument("--text", required=True, help="Short sentence to synthesize.")
     parser.add_argument("--output", default="sample.wav", help="Path of the WAV file to create.")
+    parser.add_argument("--temperature", type=float, default=0.85, help="Temperature for generation (default: 0.85).")
+    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p for generation (default: 0.95).")
+    parser.add_argument("--top-k", type=int, help="Top-k for generation (Azzurra only).")
     args = parser.parse_args()
 
     text = build_text(args.text)
@@ -47,10 +50,11 @@ def main() -> None:
         should_stop=None,
         repetition_penalty=1.1,
         min_p=0.02,
-        top_p=0.95,
+        top_p=args.top_p,
+        top_k=args.top_k,
         exaggeration=0.4,
         cfg_weight=0.8,
-        temperature=0.85,
+        temperature=args.temperature,
         use_multilingual=False,
         language_id="it",
         audio_prompt_wav=None,

@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import logging
 import json
+import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,7 +25,7 @@ COLLECTION_DIR = SCRIPT_DIR / "audioBook"
 CHAPTER_MANIFEST = "chapter_exports.json"
 
 # Settings mirrored from convert_tzone.sh
-CLI_ARGUMENTS = (
+CLI_ARGUMENTS = [
     "--speed", "0.88",
     "--repetition-penalty", "1.05",
     "--min-p", "0.02",
@@ -36,7 +38,51 @@ CLI_ARGUMENTS = (
     "--use-multilingual",
     "--language-id", "it",
     "--disable-alignment-guard",
-)
+]
+
+
+def override_cli_argument(args: List[str], flag: str, value: str | None) -> None:
+    if value is None:
+        return
+    while flag in args:
+        idx = args.index(flag)
+        del args[idx:idx + 2]
+    args.extend([flag, value])
+
+
+def override_cli_flag(args: List[str], flag: str, enabled: bool | None) -> None:
+    if enabled is None:
+        return
+    while flag in args:
+        args.remove(flag)
+    if enabled:
+        args.append(flag)
+
+
+def build_csm_extra_args(existing: str | None, top_k: int | None) -> str | None:
+    if top_k is None:
+        return existing
+    tokens = shlex.split(existing) if existing else []
+    if "--top-k" in tokens:
+        idx = tokens.index("--top-k")
+        if idx + 1 < len(tokens):
+            tokens[idx + 1] = str(int(top_k))
+        else:
+            tokens.append(str(int(top_k)))
+    else:
+        tokens.extend(["--top-k", str(int(top_k))])
+    return shlex.join(tokens)
+
+
+def build_cli_env(top_k: int | None) -> Dict[str, str] | None:
+    if top_k is None:
+        return None
+    env = os.environ.copy()
+    env["CHATTERBLEZ_CSM_EXTRA_ARGS"] = build_csm_extra_args(
+        env.get("CHATTERBLEZ_CSM_EXTRA_ARGS"),
+        top_k,
+    ) or ""
+    return env
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +140,63 @@ def parse_args() -> argparse.Namespace:
         help="Generate standalone files per chapter instead of a single audiobook.",
     )
     parser.add_argument(
+        "--speed",
+        type=float,
+        help="Override speech speed passed to the Chatterblez CLI.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        help="Override repetition penalty passed to the Chatterblez CLI.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        help="Override min-p sampling passed to the Chatterblez CLI.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        help="Override top-p sampling passed to the Chatterblez CLI.",
+    )
+    parser.add_argument(
+        "--exaggeration",
+        type=float,
+        help="Override exaggeration passed to the Chatterblez CLI.",
+    )
+    parser.add_argument(
+        "--cfg-weight",
+        type=float,
+        help="Override cfg-weight passed to the Chatterblez CLI.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help="Override the sampling temperature passed to the Chatterblez CLI.",
+    )
+    parser.add_argument(
+        "--use-multilingual",
+        dest="use_multilingual",
+        action="store_true",
+        help="Enable the multilingual Chatterbox model.",
+    )
+    parser.add_argument(
+        "--no-use-multilingual",
+        dest="use_multilingual",
+        action="store_false",
+        help="Disable the multilingual Chatterbox model.",
+    )
+    parser.set_defaults(use_multilingual=None)
+    parser.add_argument(
+        "--language-id",
+        help="Override language id passed to the multilingual model.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        help="Top-k sampling for csm.rs (forwarded via CHATTERBLEZ_CSM_EXTRA_ARGS).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -125,7 +228,46 @@ def build_cli_command(
     filterlist: str | None = None,
     chapter_indices: str | None = None,
     per_chapter_export: bool = False,
+    speed: float | None = None,
+    repetition_penalty: float | None = None,
+    min_p: float | None = None,
+    top_p: float | None = None,
+    exaggeration: float | None = None,
+    cfg_weight: float | None = None,
+    temperature: float | None = None,
+    use_multilingual: bool | None = None,
+    language_id: str | None = None,
+    top_k: int | None = None,
 ) -> List[str]:
+    cli_args = list(CLI_ARGUMENTS)
+    override_cli_argument(cli_args, "--speed", f"{float(speed):.6f}" if speed is not None else None)
+    override_cli_argument(
+        cli_args,
+        "--repetition-penalty",
+        f"{float(repetition_penalty):.6f}" if repetition_penalty is not None else None,
+    )
+    override_cli_argument(cli_args, "--min-p", f"{float(min_p):.6f}" if min_p is not None else None)
+    override_cli_argument(cli_args, "--top-p", f"{float(top_p):.6f}" if top_p is not None else None)
+    override_cli_argument(
+        cli_args,
+        "--exaggeration",
+        f"{float(exaggeration):.6f}" if exaggeration is not None else None,
+    )
+    override_cli_argument(
+        cli_args,
+        "--cfg-weight",
+        f"{float(cfg_weight):.6f}" if cfg_weight is not None else None,
+    )
+    override_cli_argument(
+        cli_args,
+        "--temperature",
+        f"{float(temperature):.6f}" if temperature is not None else None,
+    )
+    if use_multilingual is not None:
+        override_cli_flag(cli_args, "--use-multilingual", use_multilingual)
+    override_cli_argument(cli_args, "--language-id", language_id)
+    if top_k is not None:
+        cli_args.extend(["--top-k", str(int(top_k))])
     cmd = [
         sys.executable,
         str(SCRIPT_DIR / "cli.py"),
@@ -133,7 +275,7 @@ def build_cli_command(
         str(book_path),
         "--output",
         str(output_dir),
-        *CLI_ARGUMENTS,
+        *cli_args,
     ]
     if filterlist:
         cmd += ["--filterlist", filterlist]
@@ -144,9 +286,9 @@ def build_cli_command(
     return cmd
 
 
-def run_cli(command: Sequence[str]) -> None:
+def run_cli(command: Sequence[str], env: Dict[str, str] | None = None) -> None:
     logging.info("Running CLI command: %s", " ".join(command))
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=env)
 
 
 def find_generated_file(folder: Path, pattern: str, description: str) -> Path:
@@ -333,6 +475,16 @@ def process_book(
     filterlist: str | None = None,
     chapter_indices: str | None = None,
     per_chapter_export: bool = False,
+    speed: float | None = None,
+    repetition_penalty: float | None = None,
+    min_p: float | None = None,
+    top_p: float | None = None,
+    exaggeration: float | None = None,
+    cfg_weight: float | None = None,
+    temperature: float | None = None,
+    use_multilingual: bool | None = None,
+    language_id: str | None = None,
+    top_k: int | None = None,
 ) -> Dict[str, Union[Path, str, None]]:
     book_path = resolve_book_path(str(book))
     book_basename = book_path.stem
@@ -349,8 +501,19 @@ def process_book(
         filterlist,
         chapter_indices,
         per_chapter_export=per_chapter_export,
+        speed=speed,
+        repetition_penalty=repetition_penalty,
+        min_p=min_p,
+        top_p=top_p,
+        exaggeration=exaggeration,
+        cfg_weight=cfg_weight,
+        temperature=temperature,
+        use_multilingual=use_multilingual,
+        language_id=language_id,
+        top_k=top_k,
     )
-    run_cli(cli_command)
+    cli_env = build_cli_env(top_k)
+    run_cli(cli_command, env=cli_env)
 
     final_folder = collect_dir / book_basename
     final_folder.mkdir(parents=True, exist_ok=True)
@@ -469,6 +632,16 @@ def main() -> None:
         filterlist=args.filterlist,
         chapter_indices=args.chapter_indices,
         per_chapter_export=args.per_chapter_export,
+        speed=args.speed,
+        repetition_penalty=args.repetition_penalty,
+        min_p=args.min_p,
+        top_p=args.top_p,
+        exaggeration=args.exaggeration,
+        cfg_weight=args.cfg_weight,
+        temperature=args.temperature,
+        use_multilingual=args.use_multilingual,
+        language_id=args.language_id,
+        top_k=args.top_k,
     )
     logging.info("Run %s finished. Assets: %s", outputs["run_id"], outputs["folder"])
 

@@ -85,6 +85,16 @@ CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
 class ProcessOptions(BaseModel):
     filterlist: Optional[str] = None
     selected_chapters: Optional[List[int]] = None
+    repetition_penalty: Optional[float] = None
+    min_p: Optional[float] = None
+    top_p: Optional[float] = None
+    exaggeration: Optional[float] = None
+    cfg_weight: Optional[float] = None
+    temperature: Optional[float] = None
+    speed: Optional[float] = None
+    use_multilingual: Optional[bool] = None
+    language_id: Optional[str] = None
+    top_k: Optional[int] = None
 
 
 class VoiceTestRequest(BaseModel):
@@ -95,6 +105,7 @@ class VoiceTestRequest(BaseModel):
     exaggeration: float = 0.4
     cfg_weight: float = 0.8
     temperature: float = 0.85
+    top_k: Optional[int] = None
     speed: float = 1.0
     use_multilingual: bool = False
     language_id: str = "en"
@@ -278,6 +289,7 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
         repetition_penalty=payload.repetition_penalty,
         min_p=payload.min_p,
         top_p=payload.top_p,
+        top_k=payload.top_k,
         exaggeration=payload.exaggeration,
         cfg_weight=payload.cfg_weight,
         temperature=payload.temperature,
@@ -533,6 +545,16 @@ def run_pipeline(
     user: Dict,
     filterlist: Optional[str] = None,
     selected_chapter_indices: Optional[List[int]] = None,
+    repetition_penalty: Optional[float] = None,
+    min_p: Optional[float] = None,
+    top_p: Optional[float] = None,
+    exaggeration: Optional[float] = None,
+    cfg_weight: Optional[float] = None,
+    temperature: Optional[float] = None,
+    speed: Optional[float] = None,
+    use_multilingual: Optional[bool] = None,
+    language_id: Optional[str] = None,
+    top_k: Optional[int] = None,
 ) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     import_path = Path(book["import_path"])
@@ -561,6 +583,26 @@ def run_pipeline(
                 continue
         if indices:
             cmd += ["--chapter-indices", ",".join(indices)]
+    if repetition_penalty is not None:
+        cmd += ["--repetition-penalty", f"{float(repetition_penalty):.6f}"]
+    if min_p is not None:
+        cmd += ["--min-p", f"{float(min_p):.6f}"]
+    if top_p is not None:
+        cmd += ["--top-p", f"{float(top_p):.6f}"]
+    if exaggeration is not None:
+        cmd += ["--exaggeration", f"{float(exaggeration):.6f}"]
+    if cfg_weight is not None:
+        cmd += ["--cfg-weight", f"{float(cfg_weight):.6f}"]
+    if temperature is not None:
+        cmd += ["--temperature", f"{float(temperature):.6f}"]
+    if speed is not None:
+        cmd += ["--speed", f"{float(speed):.6f}"]
+    if use_multilingual is not None:
+        cmd.append("--use-multilingual" if use_multilingual else "--no-use-multilingual")
+    if language_id:
+        cmd += ["--language-id", language_id]
+    if top_k is not None:
+        cmd += ["--top-k", str(int(top_k))]
     cmd.append("--per-chapter-export")
     job_info = {
         "book_id": book["id"],
@@ -694,11 +736,31 @@ def process_book(
                     continue
             if cleaned:
                 selected_indices = cleaned
+        repetition_penalty = options.repetition_penalty if options else None
+        min_p = options.min_p if options else None
+        top_p = options.top_p if options else None
+        exaggeration = options.exaggeration if options else None
+        cfg_weight = options.cfg_weight if options else None
+        temperature = options.temperature if options else None
+        speed = options.speed if options else None
+        use_multilingual = options.use_multilingual if options else None
+        language_id = options.language_id if options else None
+        top_k = options.top_k if options else None
         job_state = run_pipeline(
             book,
             user,
             filterlist=filterlist,
             selected_chapter_indices=selected_indices,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            speed=speed,
+            use_multilingual=use_multilingual,
+            language_id=language_id,
+            top_k=top_k,
         )
     finally:
         set_user_in_use(user["id"], False)

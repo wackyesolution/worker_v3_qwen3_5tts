@@ -129,9 +129,12 @@ install_csm_rs() {
     echo "pkg-config/libssl-dev install skipped (apt not available). Install them manually if missing." >&2
   fi
 
+  # Install Rust if cargo is not found
   if ! command -v "$cargo_bin" >/dev/null 2>&1; then
-    echo "Cargo non trovato. Installa Rust (curl https://sh.rustup.rs | sh) o imposta CARGO_BIN." >&2
-    exit 1
+    banner "Installing Rust (rustup)"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    export PATH="$HOME/.cargo/bin:$PATH"
+    cargo_bin="$HOME/.cargo/bin/cargo"
   fi
 
   banner "Building csm.rs ($features)"
