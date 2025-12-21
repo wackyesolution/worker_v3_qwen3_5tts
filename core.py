@@ -550,6 +550,24 @@ def clean_line(line: str) -> str:
     line = multiple_periods_re.sub('.', line)                 # Remove repeated .
     line = space_re.sub(' ', line)                            # Collapse spaces
     return line.strip()
+
+
+def merge_hyphenated_lines(lines: list[str]) -> list[str]:
+    """Merge words split by end-of-line hyphens (PDF/EPUB line wraps)."""
+    merged: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        while line.endswith("-") and i + 1 < len(lines):
+            next_line = lines[i + 1].lstrip()
+            if next_line and re.match(r"[0-9A-Za-z\u00C0-\u017F]", next_line):
+                line = line[:-1] + next_line
+                i += 1
+            else:
+                break
+        merged.append(line)
+        i += 1
+    return merged
 def main(file_path, pick_manually, speed, book_year='', output_folder='.',
          max_chapters=None, max_sentences=None, selected_chapters=None, selected_chapter_indices=None, post_event=None, audio_prompt_wav=None, batch_files=None, ignore_list=None, should_stop=None,
          repetition_penalty=1.1, min_p=0.02, top_p=0.95, top_k=None, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
@@ -771,13 +789,14 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
             break
         if max_chapters and i > max_chapters: break
         lines = chapter.extracted_text.splitlines()
-        text = "\n".join(
-            cleaned_line
-            for line in lines
-            if (
-                cleaned_line :=  clean_line(line)
-            ).strip() and re.search(r'\w', cleaned_line)
-        )
+        cleaned_lines = []
+        for line in lines:
+            cleaned_line = clean_line(line)
+            if cleaned_line.strip() and re.search(r"\w", cleaned_line):
+                cleaned_lines.append(cleaned_line)
+        cleaned_lines = merge_hyphenated_lines(cleaned_lines)
+        # Collapse PDF line wraps so mid-sentence newlines don't hit the TTS.
+        text = " ".join(cleaned_lines)
 
         # Sanitize the chapter name to remove all non-alphanumeric characters for the filename
         xhtml_file_name = re.sub(r'[^a-zA-Z0-9-]', '', chapter.get_name()).replace('xhtml', '').replace('html', '')
