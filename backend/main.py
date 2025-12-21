@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import re
 import secrets
 import shutil
@@ -52,7 +53,6 @@ DB_PATH = BACKEND_ROOT / "backend.db"
 USERS_ROOT = BACKEND_ROOT / "users"
 LOGS_DIR = BACKEND_ROOT / "logs"
 PRE_SERVER = PROJECT_ROOT / "preServer.py"
-COLLECTION_DIR = PROJECT_ROOT / "audioBook"
 AUDIO_PROVE_DIR = PROJECT_ROOT / "audioProve"
 MAX_LOG_LINES = 10000
 
@@ -147,6 +147,28 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS job_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                book_id INTEGER NOT NULL,
+                run_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                error TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_job_history_user ON job_history(user_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_job_history_book ON job_history(book_id)"
+        )
         cur = conn.execute("SELECT id FROM users WHERE username=?", (ADMIN_USERNAME,))
         if not cur.fetchone():
             conn.execute(
@@ -174,6 +196,41 @@ def timestamp() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
 
+def create_job_history_entry(user_id: int, book_id: int, run_id: str) -> Optional[int]:
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO job_history (user_id, book_id, run_id, started_at, status)
+                VALUES (?, ?, ?, ?, 'running')
+                """,
+                (user_id, book_id, run_id, timestamp()),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except Exception as exc:  # pragma: no cover - non-blocking log
+        logging.warning("Failed to log job start: %s", exc)
+        return None
+
+
+def finish_job_history_entry(job_id: Optional[int], status: str, error: Optional[str] = None) -> None:
+    if job_id is None:
+        return
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE job_history
+                SET finished_at = ?, status = ?, error = ?
+                WHERE id = ?
+                """,
+                (timestamp(), status, error, job_id),
+            )
+            conn.commit()
+    except Exception as exc:  # pragma: no cover - non-blocking log
+        logging.warning("Failed to log job finish: %s", exc)
+
+
 def require_book_owner(book_id: int, user_id: int) -> sqlite3.Row:
     with get_connection() as conn:
         cur = conn.execute(
@@ -190,10 +247,17 @@ def user_folders(username: str) -> Dict[str, Path]:
     folder_name = f"ID{username.upper()}"
     base = USERS_ROOT / folder_name
     import_dir = base / "BookImport"
-    export_dir = base / "BookExport"
-    for directory in (base, import_dir, export_dir):
+    # Per-user library/work folders keep outputs out of global paths.
+    export_dir = base / "Books"
+    work_dir = base / "BookWork"
+    for directory in (base, import_dir, export_dir, work_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    return {"base": base, "import": import_dir, "export": export_dir}
+    return {"base": base, "import": import_dir, "export": export_dir, "work": work_dir}
+
+
+def book_export_dir(export_root: Path, book_id: int) -> Path:
+    # Keep a stable per-book folder under each user, so exports are not global.
+    return export_root / f"book_{book_id}"
 
 
 def get_current_user(credentials: HTTPBasicCredentials = Depends(security)) -> Dict:
@@ -228,10 +292,11 @@ def reset_all_users_in_use() -> None:
 
 def list_exports(book_id: int, export_dir: Path) -> List[Dict[str, str]]:
     exports: List[Dict[str, str]] = []
+    book_dir = book_export_dir(export_dir, book_id)
     prefix = f"book_{book_id}_"
-    if not export_dir.exists():
+    if not book_dir.exists():
         return exports
-    for artifact in sorted(export_dir.glob(f"{prefix}*")):
+    for artifact in sorted(book_dir.glob(f"{prefix}*")):
         suffix = artifact.suffix.lower()
         kind = ARTIFACT_KINDS.get(suffix)
         if not kind:
@@ -557,165 +622,168 @@ def run_pipeline(
     top_k: Optional[int] = None,
 ) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
-    import_path = Path(book["import_path"])
-    if not import_path.exists():
-        raise HTTPException(status_code=404, detail="File del libro non trovato.")
-    slug = slugify(import_path.stem)
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = LOGS_DIR / f"book_{book['id']}_{run_id}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable,
-        str(PRE_SERVER),
-        "--book",
-        str(import_path),
-        "--run-id",
-        run_id,
-    ]
-    if filterlist:
-        cmd += ["--filterlist", filterlist]
-    if selected_chapter_indices:
-        indices = []
-        for idx in selected_chapter_indices:
-            try:
-                indices.append(str(int(idx)))
-            except (TypeError, ValueError):
-                continue
-        if indices:
-            cmd += ["--chapter-indices", ",".join(indices)]
-    if repetition_penalty is not None:
-        cmd += ["--repetition-penalty", f"{float(repetition_penalty):.6f}"]
-    if min_p is not None:
-        cmd += ["--min-p", f"{float(min_p):.6f}"]
-    if top_p is not None:
-        cmd += ["--top-p", f"{float(top_p):.6f}"]
-    if exaggeration is not None:
-        cmd += ["--exaggeration", f"{float(exaggeration):.6f}"]
-    if cfg_weight is not None:
-        cmd += ["--cfg-weight", f"{float(cfg_weight):.6f}"]
-    if temperature is not None:
-        cmd += ["--temperature", f"{float(temperature):.6f}"]
-    if speed is not None:
-        cmd += ["--speed", f"{float(speed):.6f}"]
-    if use_multilingual is not None:
-        cmd.append("--use-multilingual" if use_multilingual else "--no-use-multilingual")
-    if language_id:
-        cmd += ["--language-id", language_id]
-    if top_k is not None:
-        cmd += ["--top-k", str(int(top_k))]
-    cmd.append("--per-chapter-export")
-    job_info = {
-        "book_id": book["id"],
-        "book_title": book["title"],
-        "run_id": run_id,
-        "user_id": user["id"],
-        "username": user["username"],
-        "started_at": timestamp(),
-        "log_path": str(log_path),
-    }
-    retcode = -1
+    job_history_id: Optional[int] = None
+    job_status = "failed"
+    job_error: Optional[str] = None
     try:
-        with log_path.open("w", encoding="utf-8") as log_handle:
-            process = subprocess.Popen(
-                cmd,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                text=True,
+        import_path = Path(book["import_path"])
+        if not import_path.exists():
+            raise HTTPException(status_code=404, detail="File del libro non trovato.")
+        slug = slugify(import_path.stem)
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        job_history_id = create_job_history_entry(user["id"], book["id"], run_id)
+        log_path = LOGS_DIR / f"book_{book['id']}_{run_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        work_root = user["folders"]["work"]
+        output_base = work_root / "output"
+        # Use per-user temp dirs so chapter splits never land in global folders.
+        collect_dir = work_root / f"collect_{run_id}"
+        cmd = [
+            sys.executable,
+            str(PRE_SERVER),
+            "--book",
+            str(import_path),
+            "--run-id",
+            run_id,
+            "--output-base",
+            str(output_base),
+            "--collect-dir",
+            str(collect_dir),
+        ]
+        if filterlist:
+            cmd += ["--filterlist", filterlist]
+        if selected_chapter_indices:
+            indices = []
+            for idx in selected_chapter_indices:
+                try:
+                    indices.append(str(int(idx)))
+                except (TypeError, ValueError):
+                    continue
+            if indices:
+                cmd += ["--chapter-indices", ",".join(indices)]
+        if repetition_penalty is not None:
+            cmd += ["--repetition-penalty", f"{float(repetition_penalty):.6f}"]
+        if min_p is not None:
+            cmd += ["--min-p", f"{float(min_p):.6f}"]
+        if top_p is not None:
+            cmd += ["--top-p", f"{float(top_p):.6f}"]
+        if exaggeration is not None:
+            cmd += ["--exaggeration", f"{float(exaggeration):.6f}"]
+        if cfg_weight is not None:
+            cmd += ["--cfg-weight", f"{float(cfg_weight):.6f}"]
+        if temperature is not None:
+            cmd += ["--temperature", f"{float(temperature):.6f}"]
+        if speed is not None:
+            cmd += ["--speed", f"{float(speed):.6f}"]
+        if use_multilingual is not None:
+            cmd.append("--use-multilingual" if use_multilingual else "--no-use-multilingual")
+        if language_id:
+            cmd += ["--language-id", language_id]
+        if top_k is not None:
+            cmd += ["--top-k", str(int(top_k))]
+        cmd.append("--per-chapter-export")
+        job_info = {
+            "book_id": book["id"],
+            "book_title": book["title"],
+            "run_id": run_id,
+            "user_id": user["id"],
+            "username": user["username"],
+            "started_at": timestamp(),
+            "log_path": str(log_path),
+        }
+        retcode = -1
+        try:
+            with log_path.open("w", encoding="utf-8") as log_handle:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                CURRENT_JOB = job_info
+                CURRENT_JOB_PROCESS = process
+                retcode = process.wait()
+        finally:
+            CURRENT_JOB = None
+            CURRENT_JOB_PROCESS = None
+        log_excerpt = tail_lines(log_path, 30)
+        trim_log_file(log_path, MAX_LOG_LINES)
+        if retcode != 0:
+            job_error = "Errore durante il job:\n" + "\n".join(log_excerpt)
+            raise HTTPException(
+                status_code=500,
+                detail="Errore durante il job:\n" + "\n".join(log_excerpt),
             )
-            CURRENT_JOB = job_info
-            CURRENT_JOB_PROCESS = process
-            retcode = process.wait()
-    finally:
-        CURRENT_JOB = None
-        CURRENT_JOB_PROCESS = None
-    log_excerpt = tail_lines(log_path, 30)
-    trim_log_file(log_path, MAX_LOG_LINES)
-    if retcode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail="Errore durante il job:\n" + "\n".join(log_excerpt),
-        )
 
-    final_folder = COLLECTION_DIR / slug
-    ebook_copy = final_folder / f"{slug}_{run_id}{import_path.suffix.lower()}"
+        export_root = user["folders"]["export"]
+        # Final deliverables live under backend/users/ID<USER>/Books/book_<id>/.
+        book_dir = book_export_dir(export_root, book["id"])
+        book_dir.mkdir(parents=True, exist_ok=True)
+        final_folder = collect_dir / slug
 
-    export_dir = user["folders"]["export"]
-    artifacts: List[Dict[str, str]] = []
-    chapter_audio = sorted(final_folder.glob(f"{slug}_{run_id}_chapter*.m4a"))
-    if not chapter_audio:
-        raise HTTPException(
-            status_code=500,
-            detail="Nessun file per capitolo trovato dopo la conversione.",
-        )
-    chapter_count = len(chapter_audio)
-    for idx, audio_file in enumerate(chapter_audio, start=1):
-        chapter_suffix = f"_chapter{idx:03d}"
-        dest_audio = export_dir / f"book_{book['id']}_{run_id}{chapter_suffix}{audio_file.suffix.lower()}"
-        shutil.copy2(audio_file, dest_audio)
-        artifacts.append({"kind": "wav", "path": str(dest_audio), "chapter": idx})
-        srt_file = audio_file.with_suffix(".srt")
-        if srt_file.exists():
-            dest_srt = export_dir / f"book_{book['id']}_{run_id}{chapter_suffix}.srt"
-            shutil.copy2(srt_file, dest_srt)
-            artifacts.append({"kind": "srt", "path": str(dest_srt), "chapter": idx})
-        vtt_file = audio_file.with_suffix(".vtt")
-        if vtt_file.exists():
-            dest_vtt = export_dir / f"book_{book['id']}_{run_id}{chapter_suffix}.vtt"
-            shutil.copy2(vtt_file, dest_vtt)
-            artifacts.append({"kind": "vtt", "path": str(dest_vtt), "chapter": idx})
-    merged_candidates = {
-        "wav": final_folder / f"{slug}_{run_id}.wav",
-        "m4a": final_folder / f"{slug}_{run_id}.m4a",
-        "srt": final_folder / f"{slug}_{run_id}.srt",
-        "vtt": final_folder / f"{slug}_{run_id}.vtt",
-    }
-    for kind, source in merged_candidates.items():
-        if not source.exists():
-            continue
-        dest = export_dir / f"book_{book['id']}_{run_id}{source.suffix.lower()}"
-        shutil.copy2(source, dest)
-        artifacts.append({"kind": kind if kind != "m4a" else "wav", "path": str(dest)})
-
-    final_m4a = final_folder / f"{slug}_{run_id}.m4a"
-    final_wav = final_folder / f"{slug}_{run_id}.wav"
-    final_srt = final_folder / f"{slug}_{run_id}.srt"
-    final_vtt = final_folder / f"{slug}_{run_id}.vtt"
-    for final_asset in (final_m4a, final_wav, final_srt, final_vtt):
-        if final_asset.exists():
-            suffix = final_asset.suffix.lower()
-            kind = ARTIFACT_KINDS.get(suffix)
-            if not kind:
-                continue
-            target = export_dir / f"book_{book['id']}_{run_id}{suffix}"
-            shutil.copy2(final_asset, target)
-            artifacts.append({"kind": kind, "path": str(target)})
-
-    if ebook_copy.exists():
-        ebook_dest = export_dir / f"book_{book['id']}_{run_id}{ebook_copy.suffix.lower()}"
-        shutil.copy2(ebook_copy, ebook_dest)
+        artifacts: List[Dict[str, str]] = []
+        chapter_audio = sorted(final_folder.glob(f"{slug}_{run_id}_chapter*.m4a"))
+        if not chapter_audio:
+            raise HTTPException(
+                status_code=500,
+                detail="Nessun file per capitolo trovato dopo la conversione.",
+            )
+        chapter_count = len(chapter_audio)
+        final_m4a = final_folder / f"{slug}_{run_id}.m4a"
+        final_srt = final_folder / f"{slug}_{run_id}.srt"
+        if not final_m4a.exists():
+            raise HTTPException(
+                status_code=500,
+                detail="File finale M4A non trovato dopo la conversione.",
+            )
+        dest_m4a = book_dir / f"book_{book['id']}_{run_id}{final_m4a.suffix.lower()}"
+        shutil.copy2(final_m4a, dest_m4a)
+        artifacts.append({"kind": "wav", "path": str(dest_m4a)})
+        if final_srt.exists():
+            dest_srt = book_dir / f"book_{book['id']}_{run_id}{final_srt.suffix.lower()}"
+            shutil.copy2(final_srt, dest_srt)
+            artifacts.append({"kind": "srt", "path": str(dest_srt)})
+        ebook_dest = book_dir / f"book_{book['id']}_{run_id}{import_path.suffix.lower()}"
+        shutil.copy2(import_path, ebook_dest)
         artifacts.append({"kind": "ebook", "path": str(ebook_dest)})
 
-    with get_connection() as conn:
-        conn.execute(
-            """
-            UPDATE books
-            SET processed_runs = processed_runs + 1,
-                last_run_id = ?,
-                last_processed_at = ?
-            WHERE id=?
-            """,
-            (run_id, timestamp(), book["id"]),
-        )
-        conn.commit()
+        # Cleanup: drop per-chapter/temp outputs once final files are copied.
+        output_dir = output_base / f"{slug}_{run_id}"
+        for temp_dir in (output_dir, collect_dir):
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
-    return {
-        "run_id": run_id,
-        "mode": "per_chapter",
-        "chapter_count": chapter_count,
-        "artifacts": artifacts,
-        "stdout": log_excerpt,
-        "log_path": str(log_path),
-    }
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE books
+                SET processed_runs = processed_runs + 1,
+                    last_run_id = ?,
+                    last_processed_at = ?
+                WHERE id=?
+                """,
+                (run_id, timestamp(), book["id"]),
+            )
+            conn.commit()
+
+        job_status = "success"
+        return {
+            "run_id": run_id,
+            "mode": "per_chapter",
+            "chapter_count": chapter_count,
+            "artifacts": artifacts,
+            "stdout": log_excerpt,
+            "log_path": str(log_path),
+        }
+    except HTTPException as exc:
+        if job_error is None:
+            job_error = str(exc.detail)
+        raise
+    except Exception as exc:  # pragma: no cover - bubble up
+        job_error = str(exc)
+        raise
+    finally:
+        finish_job_history_entry(job_history_id, job_status, job_error)
 
 
 @app.post("/books/{book_id}/process")
@@ -798,13 +866,16 @@ def resolve_export_path(book_id: int, run_id: Optional[str], kind: str, export_d
     suffixes = [suffix for suffix, mapped in ARTIFACT_KINDS.items() if mapped == kind]
     if not suffixes:
         raise HTTPException(status_code=400, detail="Tipo di file non supportato.")
+    book_dir = book_export_dir(export_dir, book_id)
+    if not book_dir.exists():
+        raise HTTPException(status_code=404, detail="File richiesto non trovato.")
     if run_id:
         for suffix in suffixes:
-            candidate = export_dir / f"book_{book_id}_{run_id}{suffix}"
+            candidate = book_dir / f"book_{book_id}_{run_id}{suffix}"
             if candidate.exists():
                 return candidate
     matches = sorted(
-        export_dir.glob(f"book_{book_id}_*"),
+        book_dir.glob(f"book_{book_id}_*"),
         reverse=True,
     )
     for match in matches:
@@ -824,12 +895,14 @@ def download_artifact(
     kind = kind.lower()
     require_book_owner(book_id, user["id"])
     export_dir = user["folders"]["export"]
+    book_dir = book_export_dir(export_dir, book_id)
     if filename:
         sanitized = Path(filename).name
         if not sanitized.startswith(f"book_{book_id}_"):
             raise HTTPException(status_code=400, detail="Filename non valido per questo libro.")
-        path = (export_dir / sanitized).resolve()
-        base = export_dir.resolve()
+        # Resolve inside the per-book folder to keep exports scoped per user/book.
+        path = (book_dir / sanitized).resolve()
+        base = book_dir.resolve()
         if not str(path).startswith(str(base)) or not path.exists():
             raise HTTPException(status_code=404, detail="File richiesto non trovato.")
     else:
@@ -839,14 +912,17 @@ def download_artifact(
 
 def delete_exports(book_id: int, export_dir: Path, run_id: Optional[str] = None) -> List[str]:
     removed: List[str] = []
+    book_dir = book_export_dir(export_dir, book_id)
     pattern = f"book_{book_id}_*"
     if run_id:
         if not RUN_ID_PATTERN.fullmatch(run_id):
             raise HTTPException(status_code=400, detail="run_id non valido.")
         pattern = f"book_{book_id}_{run_id}*"
-    for artifact in export_dir.glob(pattern):
+    for artifact in book_dir.glob(pattern):
         artifact.unlink(missing_ok=True)
         removed.append(artifact.name)
+    if book_dir.exists() and not any(book_dir.iterdir()):
+        book_dir.rmdir()
     return removed
 
 
