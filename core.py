@@ -531,8 +531,8 @@ def normalize_quotes(text: str) -> str:
             .replace("’", "'")
     )
 
-# Step 2: Replace disallowed characters (not letter/digit/space/period/comma/apos) with space
-non_allowed_re = re.compile(r"[^a-zA-Z0-9\s.,']+")
+# Step 2: Replace disallowed characters (keep basic Latin + common accents + speech punctuation/currency)
+non_allowed_re = re.compile(r"[^0-9A-Za-z\u00C0-\u017F\s.,'\"?!:;%€$-]+")
 
 # Step 3: Collapse multiple spaces
 space_re = re.compile(r'\s+')
