@@ -59,8 +59,8 @@ MAX_LOG_LINES = 10000
 SUPPORTED_EXTS = {".pdf", ".epub"}
 RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}$")
 ARTIFACT_KINDS = {
-    ".wav": "wav",
     ".m4a": "wav",
+    ".wav": "wav",
     ".srt": "srt",
     ".vtt": "vtt",
     ".pdf": "ebook",
