@@ -22,7 +22,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN chmod +x install_azzurra.sh \
-    && SKIP_FFMPEG=1 ./install_azzurra.sh
+    && SKIP_FFMPEG=1 SKIP_TORCH=1 USE_SYSTEM_SITE_PACKAGES=1 ./install_azzurra.sh
 
 RUN chmod +x start_worker.sh
 

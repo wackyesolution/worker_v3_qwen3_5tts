@@ -8,6 +8,8 @@ TORCH_VERSION=${TORCH_VERSION:-2.4.0}
 TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION:-2.4.0}
 SKIP_VENV=${SKIP_VENV:-0}
 SKIP_FFMPEG=${SKIP_FFMPEG:-0}
+SKIP_TORCH=${SKIP_TORCH:-0}
+USE_SYSTEM_SITE_PACKAGES=${USE_SYSTEM_SITE_PACKAGES:-0}
 
 banner() {
   printf '\n[%s]\n' "$1"
@@ -69,7 +71,11 @@ setup_venv() {
 
   banner "Setting up virtualenv at $VENV_PATH"
   if [[ ! -d "$VENV_PATH" ]]; then
-    "$PYTHON_BIN" -m venv "$VENV_PATH"
+    venv_args=()
+    if [[ "$USE_SYSTEM_SITE_PACKAGES" == "1" ]]; then
+      venv_args+=(--system-site-packages)
+    fi
+    "$PYTHON_BIN" -m venv "${venv_args[@]}" "$VENV_PATH"
   fi
   # shellcheck disable=SC1090
   source "$VENV_PATH/bin/activate"
@@ -86,6 +92,13 @@ install_base_tools() {
 }
 
 install_torch_stack() {
+  if [[ "$SKIP_TORCH" == "1" ]]; then
+    banner "Skipping torch/torchaudio installation (SKIP_TORCH=1)"
+    if [[ "$USE_SYSTEM_SITE_PACKAGES" != "1" ]]; then
+      echo "Warning: torch install skipped without system-site-packages. Ensure torch is available." >&2
+    fi
+    return
+  fi
   banner "Installing torch/torchaudio from $CUDA_INDEX_URL"
   local torch_spec="torch"
   local torchaudio_spec="torchaudio"
