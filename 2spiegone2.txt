@@ -1,0 +1,40 @@
+rispondi alle varie domande per capire a che stiamo
+1. il central ora ci fa loggare uguale al exWorker?
+2. il central ora riceve i processing di user X con file X e lo aggiunge ad una LISTA con max 10 
+3. il central fa lo step 2 quando il CLIENT usa l'endpoint di prima che usavamo direttamente al worker QUINDI non si accorge di differenza?
+4. il central per ogni job riceve un heartbeat dal futuro worker? 
+5. il central per ogni job monitora quando è cominciato , in che stato si trova dalla tabella dei job collegata poi alla coda centrale che è collegata ai futuri worker non ancora inseriti?
+
+6.ti trovi bene con me che e come ragiono?
+
+
+Domanda difficile:
+supponendo che l'ExWorker monolite funziona gia PERFETTAMENTE lato creazione file 
+attualmente basterebbe: 
+1. farlo connettere attendendo il primo heartbeat dopo che lo inizializzeremo dal central (attendiamo che parte )
+
+quindi 1.1: aggiungere il primo ping appena è PARTITO per dire: IO WORKER DI ID JOB xyz SONO ONLINE e PRONTO 
+
+2. serve passargli IL FILE da PROCESSARE e i parametri vari che normalmente passa il CLIENT al EXWORKER ora dovrebbe prenderli il CENTRAL dallo stesso ENDPOINT -> passarli ad un worker 
+
+3. il worker parte creando una cartella di uguale struttura /USER/boh nonmi ricordo/ etc etc ocn i file dentro
+
+4. parte UGUALE ALLO STESSO MODO (è perfetto ora la pipeline di elaborazione)
+
+5. deve fare ping ogni tot al CENTRAL Che si occupa di immagazinare lo status nella tabella del job (se è in corso, se fallito/non risponde piu/se è riuscito)
+
+se è fallito: METTI JOB IN ERRORE, toglilo dalla coda (lo lasci solo nella cronologia) CHE DEVO RIGUARDARLO DOPO dalla LISTA per fixare eventuali bug 
+
+se è in corso : ottimo
+
+se è non risponde uguale a quando è fallito
+
+se è riuscito beh, segnalo come riuscito , toglilo dalla coda e via.
+
+
+6. lato WORKER appena ha completato trasferire i file al CENTRAL. 
+
+7. il central clonando gli endopoint che ora sono nel worker:trasferiresu richiesta al client del utente loggaot il libro e l'srt (come ora fa gia l'exworker verso il client)
+
+
+CHE NE PENSI?

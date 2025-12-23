@@ -1,0 +1,31 @@
+ok riguardo il deploying del worker che è la fase successiva:
+
+su runpod io attualmente depoloyo un immagine chiamata torch /cuda python 3.11 
+e devo pero installarci ogni volta le venv e altri cazzi ci metto 30 min per installare tutto l'ambiete
+in ottica che mi servono come worker devo deployare un immagine gia pronta con torch cuda python + ffmpeg + .venv gia installate cosi che posso
+Lanciarlo , avviarlo direttamente con il comando python3 start main.py etc etc 
+
+Attualmente:
+
+1. avvio l'immagine
+2. installo usando 
+
+
+cd /workspace && \
+git clone [https://github.com/wackyesolution/Chatterblez_FINITIO](https://github.com/wackyesolution/Chatterblez_FINITIO) && \
+cd Chatterblez_FINITIO && \
+chmod +x install_azzurra.sh && \
+./install_azzurra.sh  
+
+
+3.Riavvio perdendo FFMPEG e runno il comando:
+
+
+bash -lc "apt-get update && apt-get install -y ffmpeg && cd /workspace/Chatterblez_FINITIO && git pull origin main && source .venv-azzurra/bin/activate && source .azzurra-env && uvicorn backend.main:app --host 0.0.0.0 --port 7860"
+
+
+Vorrei evitare. questo Tram tram e runnare il worker MEGA pronto al avvio cosi posso avviarlo con un semplice: 
+
+git pull origin main && source .venv-azzurra/bin/activate && source .azzurra-env && uvicorn backend.main:app --host 0.0.0.0 --port 7860
+direttamente al lancio.
+

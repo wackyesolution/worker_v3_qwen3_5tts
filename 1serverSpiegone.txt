@@ -1,0 +1,74 @@
+Questo server attualmente 
+
+1. gestisce login e. password degli utenti
+2. fa da worker con ffmpeg, whisper, azzurra crea x utente da PDF/Testo -> AUDIO + SRT e lo da AL CLIENT.
+
+
+Cosa voglio:
+
+Dividerlo in due:
+
+    Server Central: non ancora esistente
+
+
+    Worker: (Composto da questo codice qui: con ffmpeg whisper etc.)
+
+
+Perchè? perchè se ho 100 utenti che vogliono generare un libro, ogni utente impiega 8h per farlo.
+quindi: creare un worker per utente e gestire la coda globale dal server central.
+
+
+Attualmente come funzoina:
+
+1. deployo un server con una a5000 su runpods con imagine: torch + python 3.11
+2. installo usando install_azzurra.sh tutto (vedi tu stesso cosa fa). (qui installa ffmpeg etc)
+
+3. riavvio la macchina con  il seguente comando come comando di avvio:
+bash -lc "apt-get update && apt-get install -y ffmpeg && cd /workspace/Chatterblez_FINITIO && git pull origin main && source .venv-azzurra/bin/activate && source .azzurra-env && uvicorn backend.main:app --host 0.0.0.0 --port 7860"
+
+reinstallo ffmpeg perche al riavvio lascia solo le venv di /workspace/ ma resetta ffmpeg.
+
+
+QUI è attivo e genero i libri.
+
+
+
+Cosa vorrei:
+
+Che mi loggo da client tramite Server central (spostiamo qui l'auth del client)
+Che il server central prende in in carico i libri in una queue globale 
+QUando il server central prende in carico: per ogni JOB deploya un worker, gli passa il file da processare, e parte 
+quando completa il file m4a + srt lo passa al server central che lo immagazina nella cartella del utente.
+
+QUI il worker si elimina e fine lavoro.
+
+
+Qui il server central custodisce i file degli utenti per utente, fa da storage, autenticazione e da lanciatore di worker:
+con max 1 worker alla volta PER UTENTE 
+max 10 worker alla volta.
+Se abbiamo gia 10 worker dice riprova piu tardi la coda è piena per ora.
+
+
+Cosi possimao scalarlo quanto vogliamo in futuro.
+
+
+
+
+
+ORa il codice per generare il file audio (il grosso) è gia qui in questa cartella.
+
+Il server central non esiste ma puo essere fatto riprpoponendo il sistema di login iniziale
+
+
+Il client che fa request non VOGLIO CAMBIARLO in niente. QUINDI mi raccomando non cambiare gli endpoint. piuttosto cambieremo il link a cui connettersi indirizzando al Server Central e non al worker.
+ma il server central dovrà rispondere Alle authenticazione etc allo stesso identico modo.
+
+
+Come iniziare:
+
+IO propongo al posto di fare un nuovo codice di riutilizzare lo stesso codice qui presente ma con degli if.
+
+
+il server Central deve gestire la coda: e per ogni job avviare con le api di runpods un worker apposito per quel utente. e attenderlo.
+
+

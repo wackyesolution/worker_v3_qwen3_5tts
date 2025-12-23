@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import json
 import logging
@@ -17,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from fastapi import (
     Depends,
     FastAPI,
@@ -73,6 +75,12 @@ ARTIFACT_KINDS = {
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin"
 
+CENTRAL_BASE_URL = os.getenv("CENTRAL_BASE_URL", "").rstrip("/")
+WORKER_SHARED_TOKEN = os.getenv("WORKER_SHARED_TOKEN", "")
+WORKER_JOB_ID = os.getenv("WORKER_JOB_ID", "")
+WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "300"))
+WORKER_REQUEST_TIMEOUT = int(os.getenv("WORKER_REQUEST_TIMEOUT", "30"))
+
 app = FastAPI(title="Chatterblez Backend", version="1.0.0")
 security = HTTPBasic()
 service_lock = threading.Lock()
@@ -110,6 +118,94 @@ class VoiceTestRequest(BaseModel):
     use_multilingual: bool = False
     language_id: str = "en"
 
+
+class CentralClient:
+    def __init__(self, base_url: str, token: str, timeout: int = WORKER_REQUEST_TIMEOUT):
+        if not base_url:
+            raise ValueError("Central base URL non configurata.")
+        if not token:
+            raise ValueError("Worker token non configurato.")
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    def _headers(self) -> Dict[str, str]:
+        return {"X-Worker-Token": self.token}
+
+    def request(self, method: str, path: str, **kwargs) -> requests.Response:
+        url = f"{self.base_url}{path}"
+        headers = kwargs.pop("headers", {}) or {}
+        headers.update(self._headers())
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            timeout=self.timeout,
+            **kwargs,
+        )
+        if not response.ok:
+            raise RuntimeError(f"Central {method} {path} failed: {response.status_code} {response.text}")
+        return response
+
+    def get_job_info(self, job_id: int) -> Dict[str, Any]:
+        return self.request("GET", f"/internal/jobs/{job_id}").json()
+
+    def heartbeat(self, job_id: int, message: Optional[str] = None) -> None:
+        payload: Dict[str, Any] = {}
+        if message:
+            payload["message"] = message
+        self.request("POST", f"/internal/jobs/{job_id}/heartbeat", json=payload)
+
+    def complete(
+        self,
+        job_id: int,
+        status_value: str,
+        error: Optional[str] = None,
+        artifacts: Optional[List[Dict[str, str]]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {"status": status_value}
+        if error:
+            payload["error"] = error
+        if artifacts is not None:
+            payload["artifacts"] = artifacts
+        self.request("POST", f"/internal/jobs/{job_id}/complete", json=payload)
+
+    def download_input(self, job_id: int, destination: Path) -> None:
+        response = self.request(
+            "GET",
+            f"/internal/jobs/{job_id}/input",
+            stream=True,
+            timeout=(10, 600),
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+    def upload_artifact(self, job_id: int, path: Path) -> None:
+        with path.open("rb") as handle:
+            files = {"file": (path.name, handle, "application/octet-stream")}
+            data = {"filename": path.name}
+            self.request(
+                "POST",
+                f"/internal/jobs/{job_id}/artifacts",
+                files=files,
+                data=data,
+                timeout=(10, 600),
+            )
+
+    def upload_log(self, job_id: int, path: Path) -> None:
+        if not path.exists():
+            return
+        with path.open("rb") as handle:
+            files = {"file": (path.name, handle, "text/plain")}
+            self.request(
+                "POST",
+                f"/internal/jobs/{job_id}/log",
+                files=files,
+                timeout=(10, 600),
+            )
 
 def ensure_backend_layout() -> None:
     USERS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -185,6 +281,50 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_worker_user(username: str) -> sqlite3.Row:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if row:
+            return row
+        password = secrets.token_urlsafe(16)
+        conn.execute(
+            "INSERT INTO users (username, password, is_admin, in_use) VALUES (?, ?, 0, 0)",
+            (username, password),
+        )
+        conn.commit()
+        return conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+
+
+def ensure_worker_book(
+    user_id: int,
+    book_id: int,
+    title: str,
+    original_filename: str,
+    import_path: str,
+) -> sqlite3.Row:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
+        if row:
+            conn.execute(
+                """
+                UPDATE books
+                SET user_id = ?, title = ?, original_filename = ?, import_path = ?
+                WHERE id = ?
+                """,
+                (user_id, title, original_filename, import_path, book_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO books (id, user_id, title, original_filename, import_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (book_id, user_id, title, original_filename, import_path, timestamp()),
+            )
+        conn.commit()
+        return conn.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
 
 
 def slugify(value: str) -> str:
@@ -620,6 +760,7 @@ def run_pipeline(
     use_multilingual: Optional[bool] = None,
     language_id: Optional[str] = None,
     top_k: Optional[int] = None,
+    run_id_override: Optional[str] = None,
 ) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     job_history_id: Optional[int] = None
@@ -630,7 +771,12 @@ def run_pipeline(
         if not import_path.exists():
             raise HTTPException(status_code=404, detail="File del libro non trovato.")
         slug = slugify(import_path.stem)
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if run_id_override:
+            if not RUN_ID_PATTERN.fullmatch(run_id_override):
+                raise HTTPException(status_code=400, detail="run_id non valido.")
+            run_id = run_id_override
+        else:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_history_id = create_job_history_entry(user["id"], book["id"], run_id)
         log_path = LOGS_DIR / f"book_{book['id']}_{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -785,6 +931,148 @@ def run_pipeline(
     finally:
         finish_job_history_entry(job_history_id, job_status, job_error)
 
+
+def build_pipeline_kwargs(options: Optional[ProcessOptions]) -> Dict[str, Any]:
+    if not options:
+        return {}
+    kwargs: Dict[str, Any] = {}
+    if options.filterlist:
+        kwargs["filterlist"] = options.filterlist.strip()
+    if options.selected_chapters:
+        cleaned: List[int] = []
+        for value in options.selected_chapters:
+            try:
+                cleaned.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if cleaned:
+            kwargs["selected_chapter_indices"] = cleaned
+    if options.repetition_penalty is not None:
+        kwargs["repetition_penalty"] = options.repetition_penalty
+    if options.min_p is not None:
+        kwargs["min_p"] = options.min_p
+    if options.top_p is not None:
+        kwargs["top_p"] = options.top_p
+    if options.exaggeration is not None:
+        kwargs["exaggeration"] = options.exaggeration
+    if options.cfg_weight is not None:
+        kwargs["cfg_weight"] = options.cfg_weight
+    if options.temperature is not None:
+        kwargs["temperature"] = options.temperature
+    if options.speed is not None:
+        kwargs["speed"] = options.speed
+    if options.use_multilingual is not None:
+        kwargs["use_multilingual"] = options.use_multilingual
+    if options.language_id:
+        kwargs["language_id"] = options.language_id
+    if options.top_k is not None:
+        kwargs["top_k"] = options.top_k
+    return kwargs
+
+
+def heartbeat_loop(
+    client: CentralClient,
+    job_id: int,
+    stop_event: threading.Event,
+    interval_seconds: int,
+) -> None:
+    while not stop_event.wait(timeout=max(1, interval_seconds)):
+        try:
+            client.heartbeat(job_id)
+        except Exception as exc:  # pragma: no cover - best effort
+            logging.warning("Heartbeat failed for job %s: %s", job_id, exc)
+
+
+def run_worker_job(
+    job_id: int,
+    central_url: str,
+    worker_token: str,
+    heartbeat_interval: int,
+) -> int:
+    client = CentralClient(central_url, worker_token)
+    job_info = client.get_job_info(job_id)
+    run_id = job_info["run_id"]
+    username = job_info["username"]
+    book_id = int(job_info["book_id"])
+    book_title = job_info["book_title"]
+    payload = job_info.get("payload") or {}
+    input_filename = job_info.get("input_filename") or f"book_{book_id}.pdf"
+    ext = Path(input_filename).suffix or ".pdf"
+
+    client.heartbeat(job_id, "worker-started")
+
+    folders = user_folders(username)
+    import_path = folders["import"] / f"book_{book_id}{ext}"
+    client.download_input(job_id, import_path)
+
+    user_row = ensure_worker_user(username)
+    book_row = ensure_worker_book(
+        user_id=user_row["id"],
+        book_id=book_id,
+        title=book_title,
+        original_filename=input_filename,
+        import_path=str(import_path),
+    )
+    user = dict(user_row)
+    user["folders"] = folders
+
+    options = ProcessOptions(**payload) if payload else None
+    pipeline_kwargs = build_pipeline_kwargs(options)
+
+    stop_event = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        args=(client, job_id, stop_event, heartbeat_interval),
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
+    status_value = "failed"
+    error_message: Optional[str] = None
+    artifacts: Optional[List[Dict[str, str]]] = None
+    try:
+        result = run_pipeline(book_row, user, run_id_override=run_id, **pipeline_kwargs)
+        artifacts = result.get("artifacts") if isinstance(result, dict) else None
+        if artifacts:
+            for artifact in artifacts:
+                artifact_path = Path(artifact["path"])
+                client.upload_artifact(job_id, artifact_path)
+        status_value = "success"
+    except HTTPException as exc:
+        error_message = str(exc.detail)
+    except Exception as exc:
+        error_message = str(exc)
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=5)
+        log_path = LOGS_DIR / f"book_{book_id}_{run_id}.log"
+        try:
+            client.upload_log(job_id, log_path)
+        except Exception as exc:  # pragma: no cover - best effort
+            logging.warning("Failed to upload log for job %s: %s", job_id, exc)
+        try:
+            client.complete(job_id, status_value, error_message, artifacts)
+        except Exception as exc:  # pragma: no cover - best effort
+            logging.error("Failed to notify completion for job %s: %s", job_id, exc)
+            return 1
+    return 0 if status_value == "success" else 1
+
+
+def parse_worker_args(argv: List[str]) -> Dict[str, Optional[str]]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("job_id", nargs="?", help="Job ID assegnato dal server central.")
+    parser.add_argument("--job-id", dest="job_id_opt")
+    parser.add_argument("--central-url", dest="central_url")
+    parser.add_argument("--worker-token", dest="worker_token")
+    parser.add_argument("--heartbeat", dest="heartbeat", type=int)
+    args, _ = parser.parse_known_args(argv)
+    job_id_value = args.job_id_opt or args.job_id
+    return {
+        "job_id": job_id_value,
+        "central_url": args.central_url,
+        "worker_token": args.worker_token,
+        "heartbeat": str(args.heartbeat) if args.heartbeat is not None else None,
+    }
 
 @app.post("/books/{book_id}/process")
 def process_book(
@@ -1051,6 +1339,27 @@ def abort_all_jobs(user: Dict = Depends(get_current_user)):
 
 if __name__ == "__main__":
     import uvicorn
+
+    args = parse_worker_args(sys.argv[1:])
+    job_id_raw = args["job_id"] or WORKER_JOB_ID
+    central_url = args["central_url"] or CENTRAL_BASE_URL
+    worker_token = args["worker_token"] or WORKER_SHARED_TOKEN
+    heartbeat_raw = args["heartbeat"]
+    heartbeat_interval = (
+        int(heartbeat_raw) if heartbeat_raw is not None else WORKER_HEARTBEAT_SECONDS
+    )
+
+    if job_id_raw:
+        try:
+            job_id = int(job_id_raw)
+        except ValueError:
+            raise SystemExit(f"Job ID non valido: {job_id_raw}")
+        try:
+            exit_code = run_worker_job(job_id, central_url, worker_token, heartbeat_interval)
+        except Exception as exc:
+            logging.error("Worker job failed: %s", exc)
+            exit_code = 1
+        raise SystemExit(exit_code)
 
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("backend.main:app", host="0.0.0.0", port=port, reload=False)
