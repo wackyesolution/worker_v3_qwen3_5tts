@@ -1,9 +1,14 @@
 ARG BASE_IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
 
+ARG CUDA_COMPUTE_CAP=86
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Avoid bindgen_cuda probing nvidia-smi during build (set per target GPU if needed)
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 WORKDIR /workspace/Chatterblez_FINITIO
 
