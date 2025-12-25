@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../Bubbloso_Central"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../Bubbloso_IOS_Client"
+		},
+		{
+			"path": "../example_runpod/docs"
+		}
+	],
+	"settings": {}
+}

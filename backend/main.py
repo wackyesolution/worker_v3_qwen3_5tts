@@ -51,6 +51,7 @@ from core import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = PROJECT_ROOT / "backend"
+# Local sqlite is only to satisfy the legacy pipeline; Central is the source of truth.
 DB_PATH = BACKEND_ROOT / "backend.db"
 USERS_ROOT = BACKEND_ROOT / "users"
 LOGS_DIR = BACKEND_ROOT / "logs"
@@ -75,12 +76,14 @@ ARTIFACT_KINDS = {
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin"
 
+# These are injected by the Central when the worker is spawned (no client auth here).
 CENTRAL_BASE_URL = os.getenv("CENTRAL_BASE_URL", "").rstrip("/")
 WORKER_SHARED_TOKEN = os.getenv("WORKER_SHARED_TOKEN", "")
 WORKER_JOB_ID = os.getenv("WORKER_JOB_ID", "")
 WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "300"))
 WORKER_REQUEST_TIMEOUT = int(os.getenv("WORKER_REQUEST_TIMEOUT", "30"))
 
+# FastAPI only matters in standalone mode; worker jobs exit after processing.
 app = FastAPI(title="Chatterblez Backend", version="1.0.0")
 security = HTTPBasic()
 service_lock = threading.Lock()
@@ -119,6 +122,7 @@ class VoiceTestRequest(BaseModel):
     language_id: str = "en"
 
 
+# Central HTTP client for internal endpoints (job info, heartbeat, artifacts).
 class CentralClient:
     def __init__(self, base_url: str, token: str, timeout: int = WORKER_REQUEST_TIMEOUT):
         if not base_url:
@@ -135,12 +139,13 @@ class CentralClient:
     def request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.base_url}{path}"
         headers = kwargs.pop("headers", {}) or {}
+        timeout = kwargs.pop("timeout", self.timeout)
         headers.update(self._headers())
         response = requests.request(
             method,
             url,
             headers=headers,
-            timeout=self.timeout,
+            timeout=timeout,
             **kwargs,
         )
         if not response.ok:
@@ -283,6 +288,7 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+# These helpers create local stub rows for the worker pipeline (no user auth here).
 def ensure_worker_user(username: str) -> sqlite3.Row:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
@@ -763,6 +769,7 @@ def run_pipeline(
     run_id_override: Optional[str] = None,
 ) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
+    # This calls PRE_SERVER which handles ffmpeg/whisper/azzurra/csm end-to-end.
     job_history_id: Optional[int] = None
     job_status = "failed"
     job_error: Optional[str] = None
@@ -784,6 +791,7 @@ def run_pipeline(
         output_base = work_root / "output"
         # Use per-user temp dirs so chapter splits never land in global folders.
         collect_dir = work_root / f"collect_{run_id}"
+        # Launch the core pipeline in a separate process (logs go to file).
         cmd = [
             sys.executable,
             str(PRE_SERVER),
@@ -989,6 +997,7 @@ def run_worker_job(
     worker_token: str,
     heartbeat_interval: int,
 ) -> int:
+    # Fetch job from Central, run pipeline, upload artifacts/log, then notify completion.
     client = CentralClient(central_url, worker_token)
     job_info = client.get_job_info(job_id)
     run_id = job_info["run_id"]
@@ -1349,6 +1358,7 @@ if __name__ == "__main__":
         int(heartbeat_raw) if heartbeat_raw is not None else WORKER_HEARTBEAT_SECONDS
     )
 
+    # If a job id is provided, run once and exit; otherwise start the API server.
     if job_id_raw:
         try:
             job_id = int(job_id_raw)
