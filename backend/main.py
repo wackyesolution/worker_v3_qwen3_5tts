@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import json
 import logging
@@ -82,6 +83,7 @@ WORKER_SHARED_TOKEN = os.getenv("WORKER_SHARED_TOKEN", "")
 WORKER_JOB_ID = os.getenv("WORKER_JOB_ID", "")
 WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "300"))
 WORKER_REQUEST_TIMEOUT = int(os.getenv("WORKER_REQUEST_TIMEOUT", "30"))
+WORKER_UPLOAD_CHUNK_MB = int(os.getenv("WORKER_UPLOAD_CHUNK_MB", "25"))
 
 # FastAPI only matters in standalone mode; worker jobs exit after processing.
 app = FastAPI(title="Chatterblez Backend", version="1.0.0")
@@ -189,16 +191,42 @@ class CentralClient:
                     handle.write(chunk)
 
     def upload_artifact(self, job_id: int, path: Path) -> None:
+        if not path.exists():
+            raise RuntimeError(f"Artifact not found: {path}")
+        chunk_bytes = max(1, WORKER_UPLOAD_CHUNK_MB) * 1024 * 1024
+        size = path.stat().st_size
+        if size <= chunk_bytes:
+            with path.open("rb") as handle:
+                files = {"file": (path.name, handle, "application/octet-stream")}
+                data = {"filename": path.name}
+                self.request(
+                    "POST",
+                    f"/internal/jobs/{job_id}/artifacts",
+                    files=files,
+                    data=data,
+                    timeout=(10, 600),
+                )
+            return
+
+        total_chunks = max(1, math.ceil(size / chunk_bytes))
         with path.open("rb") as handle:
-            files = {"file": (path.name, handle, "application/octet-stream")}
-            data = {"filename": path.name}
-            self.request(
-                "POST",
-                f"/internal/jobs/{job_id}/artifacts",
-                files=files,
-                data=data,
-                timeout=(10, 600),
-            )
+            for index in range(total_chunks):
+                chunk = handle.read(chunk_bytes)
+                if not chunk:
+                    break
+                files = {"file": (path.name, chunk, "application/octet-stream")}
+                data = {
+                    "filename": path.name,
+                    "chunk_index": str(index),
+                    "total_chunks": str(total_chunks),
+                }
+                self.request(
+                    "POST",
+                    f"/internal/jobs/{job_id}/artifacts",
+                    files=files,
+                    data=data,
+                    timeout=(10, 600),
+                )
 
     def upload_log(self, job_id: int, path: Path) -> None:
         if not path.exists():
