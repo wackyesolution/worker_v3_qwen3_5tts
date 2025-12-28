@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../example_runpod/docs"
+		},
+		{
+			"path": "../BubblosoAdminUI"
 		}
 	],
 	"settings": {}
