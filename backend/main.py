@@ -61,7 +61,7 @@ AUDIO_PROVE_DIR = PROJECT_ROOT / "audioProve"
 MAX_LOG_LINES = 10000
 
 SUPPORTED_EXTS = {".pdf", ".epub"}
-RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}$")
+RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}(?:_preview)?$")
 ARTIFACT_KINDS = {
     ".m4a": "wav",
     ".wav": "wav",
@@ -108,6 +108,8 @@ class ProcessOptions(BaseModel):
     use_multilingual: Optional[bool] = None
     language_id: Optional[str] = None
     top_k: Optional[int] = None
+    preview: Optional[bool] = None
+    max_preview_words: Optional[int] = None
 
 
 class VoiceTestRequest(BaseModel):
@@ -795,6 +797,8 @@ def run_pipeline(
     language_id: Optional[str] = None,
     top_k: Optional[int] = None,
     run_id_override: Optional[str] = None,
+    preview_mode: bool = False,
+    max_preview_words: Optional[int] = None,
 ) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     # This calls PRE_SERVER which handles ffmpeg/whisper/azzurra/csm end-to-end.
@@ -819,6 +823,36 @@ def run_pipeline(
         output_base = work_root / "output"
         # Use per-user temp dirs so chapter splits never land in global folders.
         collect_dir = work_root / f"collect_{run_id}"
+        preview_path: Optional[Path] = None
+        if preview_mode:
+            try:
+                first_chapter_text = ""
+                suffix = import_path.suffix.lower()
+                chapters = None
+                if suffix == ".epub":
+                    epub_book = epub.read_epub(str(import_path))
+                    chapters = find_document_chapters_and_extract_texts(epub_book)
+                elif suffix == ".pdf":
+                    chapters = extract_pdf_chapters(str(import_path), book["title"])
+                if chapters:
+                    first = next((c for c in chapters if getattr(c, "extracted_text", "").strip()), chapters[0])
+                    first_chapter_text = (first.extracted_text or "").strip()
+                    selected_chapter_indices = [first.chapter_index]
+                    logging.info("Preview mode: using chapter %s (%s chars)", first.chapter_index, len(first_chapter_text))
+                if first_chapter_text:
+                    words = first_chapter_text.split()
+                    if max_preview_words and len(words) > max_preview_words:
+                        words = words[:max_preview_words]
+                        first_chapter_text = " ".join(words)
+                        logging.info("Preview mode: truncated to %s words", len(words))
+                    preview_path = work_root / f"preview_{run_id}.txt"
+                    preview_path.write_text(first_chapter_text, encoding="utf-8")
+                    import_path = preview_path
+                    logging.info("Preview mode: preview file created at %s", preview_path)
+            except Exception as exc:  # pragma: no cover - best effort
+                logging.warning("Preview mode setup failed, proceeding with full book: %s", exc)
+                preview_path = None
+
         # Launch the core pipeline in a separate process (logs go to file).
         cmd = [
             sys.executable,
@@ -951,7 +985,7 @@ def run_pipeline(
         job_status = "success"
         return {
             "run_id": run_id,
-            "mode": "per_chapter",
+            "mode": "per_chapter" if not preview_mode else "preview",
             "chapter_count": chapter_count,
             "artifacts": artifacts,
             "stdout": log_excerpt,
@@ -966,6 +1000,11 @@ def run_pipeline(
         raise
     finally:
         finish_job_history_entry(job_history_id, job_status, job_error)
+        if preview_mode and preview_path:
+            try:
+                preview_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def build_pipeline_kwargs(options: Optional[ProcessOptions]) -> Dict[str, Any]:
@@ -1054,6 +1093,8 @@ def run_worker_job(
     user["folders"] = folders
 
     options = ProcessOptions(**payload) if payload else None
+    preview_mode = bool(options.preview) if options else False
+    max_preview_words = options.max_preview_words if options else None
     pipeline_kwargs = build_pipeline_kwargs(options)
 
     stop_event = threading.Event()
@@ -1068,7 +1109,14 @@ def run_worker_job(
     error_message: Optional[str] = None
     artifacts: Optional[List[Dict[str, str]]] = None
     try:
-        result = run_pipeline(book_row, user, run_id_override=run_id, **pipeline_kwargs)
+        result = run_pipeline(
+            book_row,
+            user,
+            run_id_override=run_id,
+            preview_mode=preview_mode,
+            max_preview_words=max_preview_words or 2200,
+            **pipeline_kwargs,
+        )
         artifacts = result.get("artifacts") if isinstance(result, dict) else None
         if artifacts:
             for artifact in artifacts:
@@ -1118,6 +1166,8 @@ def process_book(
     user: Dict = Depends(get_current_user),
 ):
     job_state: Optional[Dict] = None
+    preview_mode = bool(options.preview) if options else False
+    max_preview_words = options.max_preview_words if options else None
     with get_connection() as conn:
         cur = conn.execute("SELECT in_use FROM users WHERE id=?", (user["id"],))
         in_use = cur.fetchone()[0]
@@ -1166,6 +1216,8 @@ def process_book(
             use_multilingual=use_multilingual,
             language_id=language_id,
             top_k=top_k,
+            preview_mode=preview_mode,
+            max_preview_words=max_preview_words or 2200,
         )
     finally:
         set_user_in_use(user["id"], False)
