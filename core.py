@@ -1091,7 +1091,7 @@ def convert_chapter_wav_to_m4a(source_path: Path) -> Path:
 
 def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentences=None,
                        post_event=None, should_stop=None, repetition_penalty=1.2, min_p=0.05, top_p=1.0, top_k=None, exaggeration=0.5, cfg_weight=0.5, temperature=0.8,
-                       use_multilingual=False, language_id='en', audio_prompt_wav=None, sentence_gap_ms=0, question_gap_ms=0):  # Use spacy to split into sentences
+                       use_multilingual=False, language_id='en', audio_prompt_wav=None, sentence_gap_ms=800, question_gap_ms=1000):  # Use spacy to split into sentences
 
     if should_stop is None:
         should_stop = lambda: False

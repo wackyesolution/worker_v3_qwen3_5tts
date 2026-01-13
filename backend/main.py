@@ -84,6 +84,8 @@ WORKER_JOB_ID = os.getenv("WORKER_JOB_ID", "")
 WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "300"))
 WORKER_REQUEST_TIMEOUT = int(os.getenv("WORKER_REQUEST_TIMEOUT", "30"))
 WORKER_UPLOAD_CHUNK_MB = int(os.getenv("WORKER_UPLOAD_CHUNK_MB", "25"))
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", os.getenv("WORKER_WHISPER_MODEL", "small")).strip() or "small"
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "it").strip() or "it"
 
 # FastAPI only matters in standalone mode; worker jobs exit after processing.
 app = FastAPI(title="Chatterblez Backend", version="1.0.0")
@@ -866,6 +868,11 @@ def run_pipeline(
             "--collect-dir",
             str(collect_dir),
         ]
+        if WHISPER_MODEL:
+            cmd += ["--whisper-model", WHISPER_MODEL]
+        if WHISPER_LANGUAGE:
+            cmd += ["--whisper-language", WHISPER_LANGUAGE]
+        logging.info("Whisper settings -> model=%s, language=%s", WHISPER_MODEL, WHISPER_LANGUAGE)
         if filterlist:
             cmd += ["--filterlist", filterlist]
         if selected_chapter_indices:
