@@ -84,6 +84,7 @@ WORKER_JOB_ID = os.getenv("WORKER_JOB_ID", "")
 WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "300"))
 WORKER_REQUEST_TIMEOUT = int(os.getenv("WORKER_REQUEST_TIMEOUT", "30"))
 WORKER_UPLOAD_CHUNK_MB = int(os.getenv("WORKER_UPLOAD_CHUNK_MB", "25"))
+TRIAL_MODE = (os.getenv("TRIAL_MODE", "0") or "0").strip().lower() in {"1", "true", "yes", "y", "on"}
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", os.getenv("WORKER_WHISPER_MODEL", "small")).strip() or "small"
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "it").strip() or "it"
 
@@ -92,6 +93,7 @@ app = FastAPI(title="Chatterblez Backend", version="1.0.0")
 security = HTTPBasic()
 service_lock = threading.Lock()
 preview_lock = threading.Lock()
+trial_lock = threading.Lock()
 tts_cache: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
@@ -126,6 +128,12 @@ class VoiceTestRequest(BaseModel):
     speed: float = 1.0
     use_multilingual: bool = False
     language_id: str = "en"
+    sentence_gap_ms: Optional[int] = None
+    question_gap_ms: Optional[int] = None
+
+
+class TrialRequest(VoiceTestRequest):
+    pass
 
 
 # Central HTTP client for internal endpoints (job info, heartbeat, artifacts).
@@ -539,8 +547,8 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
         use_multilingual=payload.use_multilingual,
         language_id=payload.language_id,
         audio_prompt_wav=None,
-        sentence_gap_ms=0,
-        question_gap_ms=0,
+        sentence_gap_ms=payload.sentence_gap_ms if payload.sentence_gap_ms is not None else 0,
+        question_gap_ms=payload.question_gap_ms if payload.question_gap_ms is not None else 0,
     )
     frames = write_audio_stream(output_path, chunks)
     if frames <= 0:
@@ -1352,6 +1360,21 @@ def voice_test(
     finally:
         if acquired:
             preview_lock.release()
+    return FileResponse(audio_path, filename=audio_path.name)
+
+
+@app.post("/trial/text")
+def trial_text(payload: TrialRequest):
+    if not TRIAL_MODE:
+        raise HTTPException(status_code=404, detail="Trial mode non attivo su questo worker.")
+    acquired = trial_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(status_code=409, detail="È già in corso una prova.")
+    try:
+        audio_path = synthesize_voice_preview(payload, {"username": "trial"})
+    finally:
+        if acquired:
+            trial_lock.release()
     return FileResponse(audio_path, filename=audio_path.name)
 
 
