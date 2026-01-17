@@ -1101,15 +1101,18 @@ def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentence
 
     doc = nlp(text)
     sentences = list(doc.sents)
-    batch_min_chars=150
-    batch_max_chars=800
-    num_candidates=3
-    # Then batch sentences intelligently
-    batches = batch_sentences_intelligently(
-        sentences,
-        min_chars=batch_min_chars,
-        max_chars=batch_max_chars
-    )
+    # Se sono richieste pause personalizzate, non raggruppare: una batch per frase.
+    if sentence_gap_ms or question_gap_ms:
+        batches = [s.text.strip() for s in sentences if s.text.strip()]
+    else:
+        batch_min_chars = 150
+        batch_max_chars = 800
+        num_candidates = 3
+        batches = batch_sentences_intelligently(
+            sentences,
+            min_chars=batch_min_chars,
+            max_chars=batch_max_chars
+        )
 
     total_batches = len(batches)
     logging.info(f"Split {len(sentences)} sentences into {total_batches} batches")

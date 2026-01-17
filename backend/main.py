@@ -94,6 +94,7 @@ security = HTTPBasic()
 service_lock = threading.Lock()
 preview_lock = threading.Lock()
 trial_lock = threading.Lock()
+trial_lock_started_at = 0.0
 tts_cache: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
@@ -1367,14 +1368,25 @@ def voice_test(
 def trial_text(payload: TrialRequest):
     if not TRIAL_MODE:
         raise HTTPException(status_code=404, detail="Trial mode non attivo su questo worker.")
+    global trial_lock_started_at, trial_lock
+    # Se il lock è bloccato da troppo tempo, resettiamo per evitare stalli.
+    max_lock_seconds = 300
+    if trial_lock.locked() and trial_lock_started_at:
+        elapsed = time.time() - trial_lock_started_at
+        if elapsed > max_lock_seconds:
+            logger.warning("Trial lock stallo dopo %.1fs, forzo reset del lock.", elapsed)
+            trial_lock = threading.Lock()
+            trial_lock_started_at = 0.0
     acquired = trial_lock.acquire(blocking=False)
     if not acquired:
         raise HTTPException(status_code=409, detail="È già in corso una prova.")
+    trial_lock_started_at = time.time()
     try:
         audio_path = synthesize_voice_preview(payload, {"username": "trial"})
     finally:
         if acquired:
             trial_lock.release()
+            trial_lock_started_at = 0.0
     return FileResponse(audio_path, filename=audio_path.name)
 
 
