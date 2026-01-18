@@ -573,7 +573,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
          repetition_penalty=1.1, min_p=0.02, top_p=0.95, top_k=None, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
          enable_silence_trimming=False, silence_thresh=-50, min_silence_len=500, keep_silence=100,
          use_multilingual=False, language_id='en', sentence_gap_ms=0, question_gap_ms=0, disable_alignment_guard=False,
-         per_chapter_export=False):
+         force_sentence_gaps=True, per_chapter_export=False):
     """
     Main entry point for audiobook synthesis.
     - ignore_list: list of chapter names to ignore (case-insensitive substring match)
@@ -839,7 +839,8 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
             language_id=language_id,
             audio_prompt_wav=audio_prompt_wav,
             sentence_gap_ms=sentence_gap_ms,
-            question_gap_ms=question_gap_ms
+            question_gap_ms=question_gap_ms,
+            force_sentence_gaps=force_sentence_gaps,
         )
         if should_stop():
             logging.info("Synthesis interrupted by user (after audio generation).")
@@ -1091,7 +1092,7 @@ def convert_chapter_wav_to_m4a(source_path: Path) -> Path:
 
 def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentences=None,
                        post_event=None, should_stop=None, repetition_penalty=1.2, min_p=0.05, top_p=1.0, top_k=None, exaggeration=0.5, cfg_weight=0.5, temperature=0.8,
-                       use_multilingual=False, language_id='en', audio_prompt_wav=None, sentence_gap_ms=800, question_gap_ms=1000):  # Use spacy to split into sentences
+                       use_multilingual=False, language_id='en', audio_prompt_wav=None, sentence_gap_ms=0, question_gap_ms=0):  # Use spacy to split into sentences
 
     if should_stop is None:
         should_stop = lambda: False
@@ -1101,18 +1102,14 @@ def gen_audio_segments(tts_resources, nlp, text, speed, stats=None, max_sentence
 
     doc = nlp(text)
     sentences = list(doc.sents)
-    # Se sono richieste pause personalizzate, non raggruppare: una batch per frase.
-    if sentence_gap_ms or question_gap_ms:
-        batches = [s.text.strip() for s in sentences if s.text.strip()]
-    else:
-        batch_min_chars = 150
-        batch_max_chars = 800
-        num_candidates = 3
-        batches = batch_sentences_intelligently(
-            sentences,
-            min_chars=batch_min_chars,
-            max_chars=batch_max_chars
-        )
+    batch_min_chars = 150
+    batch_max_chars = 800
+    num_candidates = 3
+    batches = batch_sentences_intelligently(
+        sentences,
+        min_chars=batch_min_chars,
+        max_chars=batch_max_chars
+    )
 
     total_batches = len(batches)
     logging.info(f"Split {len(sentences)} sentences into {total_batches} batches")

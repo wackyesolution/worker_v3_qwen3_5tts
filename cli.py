@@ -62,6 +62,11 @@ def cli_main():
         action='store_true',
         help='Disable multilingual alignment/repetition guard (prevents early truncation but removes safety checks)'
     )
+    parser.add_argument(
+        '--batch-sentences',
+        action='store_true',
+        help='Non spezzare ogni frase: usa batching intelligente (meno chiamate, gap solo tra batch).'
+    )
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -142,6 +147,7 @@ def cli_main():
             use_multilingual=args.use_multilingual,
             language_id=args.language_id,
             disable_alignment_guard=args.disable_alignment_guard,
+            force_sentence_gaps=not args.batch_sentences,
             selected_chapter_indices=chapter_indices,
             per_chapter_export=args.per_chapter_export,
         )
@@ -177,6 +183,7 @@ def cli_main():
             use_multilingual=args.use_multilingual,
             language_id=args.language_id,
             disable_alignment_guard=args.disable_alignment_guard,
+            force_sentence_gaps=not args.batch_sentences,
             selected_chapter_indices=chapter_indices,
             per_chapter_export=args.per_chapter_export,
         )
