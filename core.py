@@ -305,6 +305,9 @@ def synthesize_with_csm(
     model_id = tts_resources["model_id"]
     extra = tts_resources.get("extra_args") or ""
     extra_args = shlex.split(extra)
+    if "-A" in extra_args:  # csm.rs non supporta '-A' (capitato su runpod)
+        logging.warning("Rimuovo argomento CSM non valido '-A' da CHATTERBLEZ_CSM_EXTRA_ARGS.")
+        extra_args = [arg for arg in extra_args if arg != "-A"]
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         output_file = tmp_path / "output.wav"

@@ -1148,6 +1148,15 @@ def run_worker_job(
         stop_event.set()
         heartbeat_thread.join(timeout=5)
         log_path = LOGS_DIR / f"book_{book_id}_{run_id}.log"
+        if not log_path.exists():
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(
+                    f"Job {job_id} failed before log streaming was ready.\nerror={error_message or 'unknown'}\n",
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # pragma: no cover - best effort
+                logging.warning("Impossibile creare log minimo per job %s: %s", job_id, exc)
         try:
             client.upload_log(job_id, log_path)
         except Exception as exc:  # pragma: no cover - best effort
