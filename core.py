@@ -49,7 +49,7 @@ except ImportError:  # optional dependency used only for azzurra engine
     CsmForConditionalGeneration = None
 
 from functools import lru_cache
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 _ALIGNMENT_GUARD_DISABLED = False
 
@@ -86,6 +86,10 @@ _TTS_RESOURCE_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 CSM_BINARY = os.getenv("CHATTERBLEZ_CSM_BINARY", "csm.rs")
 CSM_MODEL_ID = os.getenv("CHATTERBLEZ_CSM_MODEL", "cartesia/azzurra-voice")
 CSM_EXTRA_ARGS = os.getenv("CHATTERBLEZ_CSM_EXTRA_ARGS", "")
+# Default chunk sizes for TTS batching. Smaller chunks reduce the chance that
+# the model emits an early EOS and drops part of a sentence.
+BATCH_MIN_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "120"))
+BATCH_MAX_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "360"))
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -571,6 +575,36 @@ def merge_hyphenated_lines(lines: list[str]) -> list[str]:
         merged.append(line)
         i += 1
     return merged
+
+
+def split_sentence_by_length(text: str, max_chars: int) -> List[str]:
+    """Split a single (very long) sentence into <= max_chars chunks on word boundaries."""
+    words = text.split()
+    if not words:
+        return []
+
+    parts: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for word in words:
+        word_len = len(word)
+        # +1 accounts for the space that will be inserted when joining
+        projected_len = current_len + (1 if current else 0) + word_len
+        if current and projected_len > max_chars:
+            parts.append(' '.join(current))
+            current = [word]
+            current_len = word_len
+        else:
+            if current:
+                current_len += 1  # space
+            current.append(word)
+            current_len += word_len
+
+    if current:
+        parts.append(' '.join(current))
+
+    return parts
 def main(file_path, pick_manually, speed, book_year='', output_folder='.',
          max_chapters=None, max_sentences=None, selected_chapters=None, selected_chapter_indices=None, post_event=None, audio_prompt_wav=None, batch_files=None, ignore_list=None, should_stop=None,
          repetition_penalty=1.1, min_p=0.02, top_p=0.95, top_k=None, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
@@ -679,8 +713,13 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         cover_image = b""
         document_chapters = extract_pdf_chapters(file_path, title)
         selected_chapters = document_chapters
-    else:
-        extension = '.epub'
+    elif extension == '.txt':
+        title = os.path.splitext(os.path.basename(file_path))[0]
+        creator = "Unknown"
+        cover_image = b""
+        document_chapters = extract_txt_chapters(file_path, title)
+        selected_chapters = document_chapters
+    elif extension == '.epub':
         book = epub.read_epub(file_path)
         meta_title = book.get_metadata('DC', 'title')
         title = meta_title[0][0] if meta_title else ''
@@ -716,6 +755,12 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
                 selected_chapters = pick_chapters(document_chapters)
             else:
                 selected_chapters = find_good_chapters(document_chapters)
+    else:
+        logging.error("Unsupported file extension: %s", extension)
+        if post_event:
+            post_event('CORE_ERROR', message=f"Unsupported file type: {extension}")
+        allow_sleep()
+        return
     if selected_chapters is None:
         selected_chapters = document_chapters
 
@@ -954,59 +999,48 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
 
 
 
-def batch_sentences_intelligently(sentences, min_chars=150, max_chars=800):
+def batch_sentences_intelligently(sentences, min_chars=BATCH_MIN_CHARS, max_chars=BATCH_MAX_CHARS):
     """
     Batch sentences into reasonable chunks for TTS processing.
 
-    OPTIMIZED FOR SPEED: Larger batches (150-800 chars) = fewer TTS calls
-
-    Args:
-        sentences: List of spacy sentence objects
-        min_chars: Minimum characters per batch (default 150, increased for speed)
-        max_chars: Maximum characters per batch (default 800, increased for speed)
-
-    Returns:
-        List of batched sentence texts
+    Notes:
+    - Smaller batches mitigate early-EOS/truncation from the TTS model.
+    - Sentences longer than `max_chars` are further split on word boundaries
+      to guarantee no text is dropped.
     """
-    batches = []
-    current_batch = []
+    batches: List[str] = []
+    current_batch: List[str] = []
     current_length = 0
 
     for sent in sentences:
-        sent_text = sent.text.strip()
-        sent_length = len(sent_text)
-
-        # Skip empty sentences
-        if not sent_text or sent_length < 2:
+        raw_sent = sent.text.strip()
+        if not raw_sent or len(raw_sent) < 2:
             continue
 
-        # If this sentence alone exceeds max_chars, add it as its own batch
-        if sent_length > max_chars:
-            # First, flush current batch if it exists
-            if current_batch:
+        # Ensure overlong sentences are broken down so we never drop text.
+        candidate_segments = [raw_sent]
+        if len(raw_sent) > max_chars:
+            candidate_segments = split_sentence_by_length(raw_sent, max_chars)
+
+        for segment in candidate_segments:
+            seg_len = len(segment)
+            if seg_len == 0:
+                continue
+
+            # If adding this segment would exceed max_chars, flush current batch first.
+            if current_length > 0 and (current_length + seg_len + 1) > max_chars:
                 batches.append(' '.join(current_batch))
                 current_batch = []
                 current_length = 0
 
-            # Add the long sentence as its own batch
-            batches.append(sent_text)
-            continue
+            current_batch.append(segment)
+            current_length += seg_len + (1 if len(current_batch) > 1 else 0)  # +1 for space between segments
 
-        # If adding this sentence would exceed max_chars, start a new batch
-        if current_length > 0 and (current_length + sent_length + 1) > max_chars:
-            batches.append(' '.join(current_batch))
-            current_batch = [sent_text]
-            current_length = sent_length
-        else:
-            # Add to current batch
-            current_batch.append(sent_text)
-            current_length += sent_length + (1 if current_batch else 0)  # +1 for space
-
-        # If we've reached a good minimum size and hit a natural break, flush
-        if current_length >= min_chars and sent_text.endswith(('.', '!', '?', '"', "'")):
-            batches.append(' '.join(current_batch))
-            current_batch = []
-            current_length = 0
+            # If we've reached a healthy size and ended on punctuation, flush.
+            if current_length >= min_chars and segment.endswith(('.', '!', '?', '"', "'")):
+                batches.append(' '.join(current_batch))
+                current_batch = []
+                current_length = 0
 
     # Don't forget the last batch
     if current_batch:
@@ -1116,6 +1150,13 @@ def gen_audio_segments(
     question_gap_ms=0,
     force_sentence_gaps=True,
 ):  # Use spacy to split into sentences
+    # NOTE (pipeline reminder):
+    # 1) spacy segmenta in frasi.
+    # 2) batch_sentences_intelligently compone batch di testo rispettando
+    #    BATCH_MIN/MAX_CHARS e, se una singola frase eccede il max, la spezza
+    #    ulteriormente su spazi (split_sentence_by_length).
+    # 3) sentence_gap_ms e question_gap_ms vengono applicati tra i batch
+    #    emessi, quindi valgono anche tra segmenti generati da una frase lunga.
 
     if should_stop is None:
         should_stop = lambda: False
@@ -1125,8 +1166,8 @@ def gen_audio_segments(
 
     doc = nlp(text)
     sentences = list(doc.sents)
-    batch_min_chars = 150
-    batch_max_chars = 800
+    batch_min_chars = BATCH_MIN_CHARS
+    batch_max_chars = BATCH_MAX_CHARS
     num_candidates = 3
     batches = batch_sentences_intelligently(
         sentences,
@@ -1294,6 +1335,18 @@ def extract_pdf_chapters(file_path, title):
     for i, chapter in enumerate(chapters):
         chapter.chapter_index = i
     return chapters
+
+
+def extract_txt_chapters(file_path: str, title: str):
+    """Wrap a plain text file into a single SimpleDocumentChapter."""
+    try:
+        text = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        logging.error("Failed to read TXT %s: %s", file_path, exc)
+        raise
+    text = text.strip()
+    chapter = SimpleDocumentChapter(f"{title}_full_text", text, chapter_index=0)
+    return [chapter]
 
 
 def is_chapter(c):

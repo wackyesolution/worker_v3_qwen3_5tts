@@ -40,6 +40,7 @@ from core import (
     find_document_chapters_and_extract_texts,
     find_good_chapters,
     extract_pdf_chapters,
+    extract_txt_chapters,
     chapter_beginning_one_liner,
     get_nlp,
     gen_audio_segments,
@@ -61,7 +62,7 @@ PRE_SERVER = PROJECT_ROOT / "preServer.py"
 AUDIO_PROVE_DIR = PROJECT_ROOT / "audioProve"
 MAX_LOG_LINES = 10000
 
-SUPPORTED_EXTS = {".pdf", ".epub"}
+SUPPORTED_EXTS = {".pdf", ".epub", ".txt"}
 RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}(?:_preview)?$")
 ARTIFACT_KINDS = {
     ".m4a": "wav",
@@ -586,6 +587,9 @@ def list_book_chapters(row: sqlite3.Row) -> List[Dict[str, Any]]:
     elif suffix == ".pdf":
         chapters = extract_pdf_chapters(str(source), row["title"])
         default_selected = {c.chapter_index for c in chapters}
+    elif suffix == ".txt":
+        chapters = extract_txt_chapters(str(source), row["title"])
+        default_selected = {0}
     else:
         raise HTTPException(status_code=400, detail="Formato non supportato per la lettura dei capitoli.")
     payload = []
@@ -846,6 +850,8 @@ def run_pipeline(
                     chapters = find_document_chapters_and_extract_texts(epub_book)
                 elif suffix == ".pdf":
                     chapters = extract_pdf_chapters(str(import_path), book["title"])
+                elif suffix == ".txt":
+                    chapters = extract_txt_chapters(str(import_path), book["title"])
                 if chapters:
                     first = next((c for c in chapters if getattr(c, "extracted_text", "").strip()), chapters[0])
                     first_chapter_text = (first.extracted_text or "").strip()
