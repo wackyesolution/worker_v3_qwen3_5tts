@@ -538,9 +538,24 @@ def normalize_quotes(text: str) -> str:
             .replace("’", "'")
     )
 
+
+def soften_double_quotes(text: str) -> str:
+    """
+    Replace double-quoted spans with guillemets to cue a slight pause without
+    the TTS pronouncing the quote as a word (es. elimina il \"met\").
+    """
+    def repl(match: re.Match[str]) -> str:
+        content = match.group(1).strip()
+        return f" «{content}» "
+
+    text = double_quote_span_re.sub(repl, text)
+    # Remove any stray double quotes that were not part of a pair
+    return text.replace('"', '')
+
 # Step 2: Replace disallowed characters (keep basic Latin + common accents + speech punctuation/currency)
 # Allow basic punctuation plus parentheses; block everything else.
-non_allowed_re = re.compile(r"[^0-9A-Za-z\u00C0-\u017F\s.,'\"?!:;%€$-()]+")
+# Added «» so we can preserve converted virgolette without being spelled out.
+non_allowed_re = re.compile(r"[^0-9A-Za-z\u00C0-\u017F\s.,'\"?!:;%€$-()«»]+")
 
 # Step 3: Collapse multiple spaces
 space_re = re.compile(r'\s+')
@@ -551,11 +566,229 @@ space_before_period_re = re.compile(r'\s+\.')
 # Step 5: Collapse consecutive periods
 multiple_periods_re = re.compile(r'\.{2,}')
 
+# Quote handling: turn "testo" into «testo» to avoid the TTS pronouncing the quote marker.
+double_quote_span_re = re.compile(r'"([^"]+)"')
+
+# Helpers: conversione numeri -> testo (cardinali/ordinali) e numeri romani
+_cardinal_0_19 = [
+    "zero",
+    "uno",
+    "due",
+    "tre",
+    "quattro",
+    "cinque",
+    "sei",
+    "sette",
+    "otto",
+    "nove",
+    "dieci",
+    "undici",
+    "dodici",
+    "tredici",
+    "quattordici",
+    "quindici",
+    "sedici",
+    "diciassette",
+    "diciotto",
+    "diciannove",
+]
+
+_tens_map = {
+    2: "venti",
+    3: "trenta",
+    4: "quaranta",
+    5: "cinquanta",
+    6: "sessanta",
+    7: "settanta",
+    8: "ottanta",
+    9: "novanta",
+}
+
+_thousands_map = {
+    1: "mille",
+    2: "duemila",
+    3: "tremila",
+    4: "quattromila",
+    5: "cinquemila",
+    6: "seimila",
+    7: "settemila",
+    8: "ottomila",
+    9: "novemila",
+}
+
+_ordinal_map_explicit = {
+    1: "primo",
+    2: "secondo",
+    3: "terzo",
+    4: "quarto",
+    5: "quinto",
+    6: "sesto",
+    7: "settimo",
+    8: "ottavo",
+    9: "nono",
+    10: "decimo",
+    11: "undicesimo",
+    12: "dodicesimo",
+    13: "tredicesimo",
+    14: "quattordicesimo",
+    15: "quindicesimo",
+    16: "sedicesimo",
+    17: "diciassettesimo",
+    18: "diciottesimo",
+    19: "diciannovesimo",
+    20: "ventesimo",
+    21: "ventunesimo",
+    22: "ventiduesimo",
+    23: "ventitreesimo",
+    24: "ventiquattresimo",
+    25: "venticinquesimo",
+    26: "ventiseiesimo",
+    27: "ventisettesimo",
+    28: "ventottesimo",
+    29: "ventinovesimo",
+    30: "trentesimo",
+}
+
+_roman_values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+
+
+def roman_to_int(value: str) -> int | None:
+    total = 0
+    prev = 0
+    for ch in reversed(value.upper()):
+        if ch not in _roman_values:
+            return None
+        val = _roman_values[ch]
+        if val < prev:
+            total -= val
+        else:
+            total += val
+            prev = val
+    return total
+
+
+def _under_hundred(n: int) -> str:
+    if n < 20:
+        return _cardinal_0_19[n]
+    tens, unit = divmod(n, 10)
+    tens_word = _tens_map.get(tens, "")
+    # Elide the final vowel of the decade with 1 or 8 (ventuno, ventotto, ottantuno, ecc.)
+    if unit in (1, 8) and tens_word:
+        tens_word = tens_word[:-1]
+    if unit == 0:
+        return tens_word
+    return f"{tens_word}{_cardinal_0_19[unit]}"
+
+
+def _under_thousand(n: int) -> str:
+    if n < 100:
+        return _under_hundred(n)
+    hundreds, rem = divmod(n, 100)
+    if hundreds == 1:
+        prefix = "cento"
+    else:
+        prefix = f"{_cardinal_0_19[hundreds]}cento"
+    # Elide the 'o' in cento when followed by ottanta/otto (centottanta, duecentottanta, ecc.)
+    if rem and (rem == 8 or 80 <= rem < 90):
+        if prefix.endswith("cento"):
+            prefix = prefix[:-1]
+    return prefix if rem == 0 else f"{prefix}{_under_hundred(rem)}"
+
+
+def int_to_italian_cardinal(n: int) -> str:
+    if n < 0 or n > 9999:
+        return str(n)
+    if n < 20:
+        return _cardinal_0_19[n]
+    if n < 100:
+        return _under_hundred(n)
+    if n < 1000:
+        return _under_thousand(n)
+    thousands, rem = divmod(n, 1000)
+    if thousands in _thousands_map:
+        prefix = _thousands_map[thousands]
+    else:
+        # defensive fallback, though with n <= 9999 we never hit this
+        prefix = f"{int_to_italian_cardinal(thousands)}mila"
+    return prefix if rem == 0 else f"{prefix}{_under_thousand(rem)}"
+
+
+def int_to_italian_ordinal(n: int) -> str:
+    if n in _ordinal_map_explicit:
+        return _ordinal_map_explicit[n]
+    if n < 1:
+        return str(n)
+    # Generic fallback: cardinal without last vowel + "esimo"
+    base = int_to_italian_cardinal(n)
+    if base and base[-1] in "aeiou":
+        base = base[:-1]
+    return f"{base}esimo"
+
+
+def convert_numbers_in_text(text: str) -> str:
+    def parse_token(raw: str) -> int | None:
+        if raw.isdigit():
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+        maybe = roman_to_int(raw)
+        return maybe
+
+    # 1) Centuries: "XX secolo" / "20 secolo" -> "ventesimo secolo"
+    def repl_century(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        number = parse_token(raw)
+        if number is None or number <= 0 or number > 9999:
+            return match.group(0)
+        return f"{int_to_italian_ordinal(number)} secolo"
+
+    century_re = re.compile(r"\b([IVXLCDM]+|\d{1,4})\s*°?\s+secolo\b", flags=re.IGNORECASE)
+    text = century_re.sub(repl_century, text)
+
+    # 2) Roman numerals (length >= 2 to avoid accidental "I" pronouns)
+    def repl_roman(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        number = roman_to_int(raw)
+        if number is None or number <= 0 or number > 9999:
+            return raw
+        return int_to_italian_cardinal(number)
+
+    text = re.sub(r"\b[IVXLCDM]{2,}\b", repl_roman, text)
+
+    # 3) 1-2 letters + digits (es. "C17" -> "C diciassette", "RX100" -> "RX cento") keeping the prefix.
+    def repl_letter_num(match: re.Match[str]) -> str:
+        letter = match.group(1)
+        try:
+            number = int(match.group(2))
+        except ValueError:
+            return match.group(0)
+        if number > 9999:
+            return match.group(0)
+        return f"{letter} {int_to_italian_cardinal(number)}"
+
+    text = re.sub(r"\b([A-Za-z]{1,2})(\d{1,4})\b", repl_letter_num, text)
+
+    # 4) Arabic numbers up to 4 digits
+    def repl_number(match: re.Match[str]) -> str:
+        try:
+            number = int(match.group(0))
+        except ValueError:
+            return match.group(0)
+        if number > 9999:
+            return match.group(0)
+        return int_to_italian_cardinal(number)
+
+    text = re.sub(r"\b\d{1,4}\b", repl_number, text)
+    return text
+
 def clean_line(line: str) -> str:
     line = normalize_quotes(line)
+    line = soften_double_quotes(line)                         # Trasforma "..." in «...» per evitare pronuncia dei segni
     line = non_allowed_re.sub(' ', line)                      # Remove unwanted chars
     line = space_before_period_re.sub('.', line)              # Remove space before .
     line = multiple_periods_re.sub('.', line)                 # Remove repeated .
+    line = convert_numbers_in_text(line)                      # Convert numeric tokens (romani e arabi) in parole
     line = space_re.sub(' ', line)                            # Collapse spaces
     return line.strip()
 

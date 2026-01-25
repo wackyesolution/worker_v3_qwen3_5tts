@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -515,7 +516,20 @@ def get_tts_resources_cached(use_multilingual: bool):
     return resources
 
 
-def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
+def _append_trial_log(log_path: Optional[Path], message: str) -> None:
+    if not log_path:
+        return
+    timestamp = datetime.utcnow().isoformat(timespec="seconds")
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message}\n")
+    except Exception:  # noqa: BLE001
+        # best-effort: avoid breaking the flow for logging issues
+        pass
+
+
+def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict, log_path: Optional[Path] = None) -> Path:
     text_lines = []
     last_blank = False
     for line in (payload.text or "").splitlines():
@@ -533,6 +547,11 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
         raise HTTPException(status_code=400, detail="Inserisci almeno qualche parola da leggere.")
     if not text.endswith((".", "!", "?")):
         text += "."
+    _append_trial_log(
+        log_path,
+        f"Preview text len={len(text)} disable_cleaning={payload.disable_cleaning} "
+        f"use_multilingual={payload.use_multilingual} language_id={payload.language_id or 'it'}",
+    )
     slug = slugify(user["username"])
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = AUDIO_PROVE_DIR / f"{slug}_{run_id}.wav"
@@ -1393,6 +1412,12 @@ def trial_text(payload: TrialRequest):
     if not TRIAL_MODE:
         raise HTTPException(status_code=404, detail="Trial mode non attivo su questo worker.")
     global trial_lock_started_at, trial_lock
+    log_path = LOGS_DIR / f"trial_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    text_preview = (payload.text or "").replace("\n", " ")[:400]
+    _append_trial_log(
+        log_path,
+        f"Request received (len={len(payload.text or '')}, disable_cleaning={payload.disable_cleaning}) preview=\"{text_preview}\"",
+    )
     # Se il lock è bloccato da troppo tempo, resettiamo per evitare stalli.
     max_lock_seconds = 300
     if trial_lock.locked() and trial_lock_started_at:
@@ -1406,12 +1431,23 @@ def trial_text(payload: TrialRequest):
         raise HTTPException(status_code=409, detail="È già in corso una prova.")
     trial_lock_started_at = time.time()
     try:
-        audio_path = synthesize_voice_preview(payload, {"username": "trial"})
+        try:
+            audio_path = synthesize_voice_preview(payload, {"username": "trial"}, log_path=log_path)
+            _append_trial_log(
+                log_path,
+                f"Audio generato: {audio_path} (bytes={audio_path.stat().st_size if audio_path.exists() else 0})",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _append_trial_log(log_path, "Errore trial:\n" + traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Errore trial worker (vedi log {log_path.name}).",
+            ) from exc
     finally:
         if acquired:
             trial_lock.release()
             trial_lock_started_at = 0.0
-    return FileResponse(audio_path, filename=audio_path.name)
+    return FileResponse(audio_path, filename=audio_path.name, headers={"X-Trial-Log": str(log_path)})
 
 
 @app.get("/example/useTest")
