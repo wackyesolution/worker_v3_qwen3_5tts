@@ -133,6 +133,7 @@ class VoiceTestRequest(BaseModel):
     language_id: str = "en"
     sentence_gap_ms: Optional[int] = None
     question_gap_ms: Optional[int] = None
+    disable_cleaning: bool = False
 
 
 class TrialRequest(VoiceTestRequest):
@@ -516,10 +517,17 @@ def get_tts_resources_cached(use_multilingual: bool):
 
 def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict) -> Path:
     text_lines = []
+    last_blank = False
     for line in (payload.text or "").splitlines():
-        cleaned = clean_line(line)
-        if cleaned:
-            text_lines.append(cleaned)
+        cleaned = line.strip() if payload.disable_cleaning else clean_line(line)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()  # normalizza spazi multipli
+        if not cleaned:
+            if last_blank:
+                continue
+            last_blank = True
+            continue
+        last_blank = False
+        text_lines.append(cleaned)
     text = " ".join(text_lines).strip()
     if not text:
         raise HTTPException(status_code=400, detail="Inserisci almeno qualche parola da leggere.")
