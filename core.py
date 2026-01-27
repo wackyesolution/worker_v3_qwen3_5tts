@@ -566,6 +566,9 @@ space_before_period_re = re.compile(r'\s+\.')
 # Step 5: Collapse consecutive periods
 multiple_periods_re = re.compile(r'\.{2,}')
 
+# Step 6: Remove a trailing period immediately after a closing parenthesis
+paren_dot_re = re.compile(r'\)\s*\.')
+
 # Quote handling: turn "testo" into «testo» to avoid the TTS pronouncing the quote marker.
 double_quote_span_re = re.compile(r'"([^"]+)"')
 
@@ -806,6 +809,7 @@ def clean_line(line: str) -> str:
     line = non_allowed_re.sub(' ', line)                      # Remove unwanted chars
     line = space_before_period_re.sub('.', line)              # Remove space before .
     line = re.sub(r'([?!])\.', r'\1', line)                    # Drop trailing '.' if it follows ? or !
+    line = paren_dot_re.sub(')', line)                         # Drop '.' that immediately follows a closing parenthesis
     line = multiple_periods_re.sub('.', line)                 # Remove repeated .
     line = convert_numbers_in_text(line)                      # Convert numeric tokens (romani e arabi) in parole
     line = space_re.sub(' ', line)                            # Collapse spaces
