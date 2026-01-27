@@ -18,6 +18,7 @@ import threading
 import time
 from datetime import datetime
 import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -101,6 +102,8 @@ trial_lock_started_at = 0.0
 tts_cache: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
+
+TRIAL_SYNTH_TIMEOUT_SECONDS = int(os.getenv("TRIAL_SYNTH_TIMEOUT_SECONDS", "180"))
 
 
 class ProcessOptions(BaseModel):
@@ -555,8 +558,18 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict, log_path: Op
     slug = slugify(user["username"])
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = AUDIO_PROVE_DIR / f"{slug}_{run_id}.wav"
+    _append_trial_log(
+        log_path,
+        f"Loading TTS resources (multilingual={payload.use_multilingual})...",
+    )
     tts_resources = get_tts_resources_cached(payload.use_multilingual)
+    _append_trial_log(
+        log_path,
+        f"TTS ready (engine={tts_resources.get('engine')})",
+    )
+    _append_trial_log(log_path, "Loading NLP pipeline...")
     nlp = get_nlp()
+    _append_trial_log(log_path, "NLP ready, starting synthesis...")
 
     chunks = gen_audio_segments(
         tts_resources,
@@ -580,9 +593,12 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict, log_path: Op
         sentence_gap_ms=payload.sentence_gap_ms if payload.sentence_gap_ms is not None else 0,
         question_gap_ms=payload.question_gap_ms if payload.question_gap_ms is not None else 0,
     )
+    _append_trial_log(log_path, "Audio chunks generated, writing stream...")
     frames = write_audio_stream(output_path, chunks)
     if frames <= 0:
+        _append_trial_log(log_path, "Nessun frame scritto: sintesi fallita.")
         raise HTTPException(status_code=500, detail="Sintesi non riuscita, nessun audio generato.")
+    _append_trial_log(log_path, f"Audio scritto: frames={frames}, path={output_path}")
     return output_path
 
 
@@ -1398,7 +1414,7 @@ def voice_test(
 ):
     acquired = preview_lock.acquire(blocking=False)
     if not acquired:
-        raise HTTPException(status_code=409, detail="È già in corso una generazione di prova.")
+        raise HTTPException(status_code=409, detail="è già in corso una generazione di prova.")
     try:
         audio_path = synthesize_voice_preview(payload, user)
     finally:
@@ -1418,6 +1434,7 @@ def trial_text(payload: TrialRequest):
         log_path,
         f"Request received (len={len(payload.text or '')}, disable_cleaning={payload.disable_cleaning}) preview=\"{text_preview}\"",
     )
+    _append_trial_log(log_path, f"Lock acquired={acquired}")
     # Se il lock è bloccato da troppo tempo, resettiamo per evitare stalli.
     max_lock_seconds = 300
     if trial_lock.locked() and trial_lock_started_at:
@@ -1428,21 +1445,32 @@ def trial_text(payload: TrialRequest):
             trial_lock_started_at = 0.0
     acquired = trial_lock.acquire(blocking=False)
     if not acquired:
-        raise HTTPException(status_code=409, detail="È già in corso una prova.")
+        raise HTTPException(status_code=409, detail="è già in corso una prova.")
     trial_lock_started_at = time.time()
     try:
-        try:
-            audio_path = synthesize_voice_preview(payload, {"username": "trial"}, log_path=log_path)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(synthesize_voice_preview, payload, {"username": "trial"}, log_path)
+            try:
+                audio_path = future.result(timeout=TRIAL_SYNTH_TIMEOUT_SECONDS)
+            except TimeoutError:
+                _append_trial_log(
+                    log_path,
+                    f"Timeout dopo {TRIAL_SYNTH_TIMEOUT_SECONDS}s: sintesi ancora in corso, lock rilasciato.",
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Sintesi di prova timeout dopo {TRIAL_SYNTH_TIMEOUT_SECONDS}s (log {log_path.name}).",
+                )
+            except Exception as exc:  # noqa: BLE001
+                _append_trial_log(log_path, "Errore trial:\n" + traceback.format_exc())
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Errore trial worker (vedi log {log_path.name}).",
+                ) from exc
             _append_trial_log(
                 log_path,
                 f"Audio generato: {audio_path} (bytes={audio_path.stat().st_size if audio_path.exists() else 0})",
             )
-        except Exception as exc:  # noqa: BLE001
-            _append_trial_log(log_path, "Errore trial:\n" + traceback.format_exc())
-            raise HTTPException(
-                status_code=500,
-                detail=f"Errore trial worker (vedi log {log_path.name}).",
-            ) from exc
     finally:
         if acquired:
             trial_lock.release()

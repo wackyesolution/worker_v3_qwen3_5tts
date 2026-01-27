@@ -782,11 +782,30 @@ def convert_numbers_in_text(text: str) -> str:
     text = re.sub(r"\b\d{1,4}\b", repl_number, text)
     return text
 
+
+def _convert_enne_age(match: re.Match[str]) -> str:
+    """Convert forms like '13enne' -> 'tredicenne'."""
+    raw = match.group(1)
+    try:
+        number = int(raw)
+    except ValueError:
+        return match.group(0)
+    if number < 0 or number > 9999:
+        return match.group(0)
+    base = int_to_italian_cardinal(number)
+    if base and base[-1] in "aeiou":
+        base = base[:-1]
+    return f"{base}enne"
+
 def clean_line(line: str) -> str:
     line = normalize_quotes(line)
+    line = line.replace("È", "è")                             # Normalize uppercase accented E to lowercase
+    line = re.sub(r"\bcazzo\b", "catzo", line, flags=re.IGNORECASE)  # Soften explicit term
+    line = re.sub(r"\b(\d{1,4})enne\b", _convert_enne_age, line, flags=re.IGNORECASE)  # 13enne -> tredicenne
     line = soften_double_quotes(line)                         # Trasforma "..." in «...» per evitare pronuncia dei segni
     line = non_allowed_re.sub(' ', line)                      # Remove unwanted chars
     line = space_before_period_re.sub('.', line)              # Remove space before .
+    line = re.sub(r'([?!])\.', r'\1', line)                    # Drop trailing '.' if it follows ? or !
     line = multiple_periods_re.sub('.', line)                 # Remove repeated .
     line = convert_numbers_in_text(line)                      # Convert numeric tokens (romani e arabi) in parole
     line = space_re.sub(' ', line)                            # Collapse spaces
