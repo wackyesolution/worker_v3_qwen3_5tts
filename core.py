@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # chatterblez - A program to convert e-books into audiobooks using
-# chatterbox-tts
+# qwen3-tts
 # by Zachary Erskine
 # by Claudio Santini 2025 - https://claudio.uk
 import logging
@@ -35,57 +35,30 @@ import queue  # Import queue for concurrent reading
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from PyPDF2 import PdfReader
-import tempfile
-import shlex
 try:
-    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-except ImportError:
-    ChatterboxMultilingualTTS = None
-
-try:
-    from transformers import AutoProcessor, CsmForConditionalGeneration
-except ImportError:  # optional dependency used only for azzurra engine
-    AutoProcessor = None
-    CsmForConditionalGeneration = None
+    from qwen_tts import Qwen3TTSModel
+except ImportError:  # optional until runtime image installs qwen-tts
+    Qwen3TTSModel = None
 
 from functools import lru_cache
 from typing import Any, Dict, Tuple, List
 
-_ALIGNMENT_GUARD_DISABLED = False
+_ALIGNMENT_GUARD_DISABLED = True
 
 
 def disable_alignment_guard_checks():
-    """
-    Turn the multilingual alignment/repetition guard into a no-op to prevent premature EOS.
-    """
-    global _ALIGNMENT_GUARD_DISABLED
-    if _ALIGNMENT_GUARD_DISABLED:
-        return
-    try:
-        from chatterbox.models.t3.inference import alignment_stream_analyzer as asa
-    except Exception as exc:  # pragma: no cover - defensive
-        logging.warning("Impossibile disattivare l'alignment guard: %s", exc)
-        return
-
-    original_step = asa.AlignmentStreamAnalyzer.step
-
-    def passthrough_step(self, logits, next_token=None):
-        return logits
-
-    passthrough_step.__doc__ = getattr(original_step, "__doc__", "Patched to skip EOS forcing")
-    asa.AlignmentStreamAnalyzer.step = passthrough_step
-    _ALIGNMENT_GUARD_DISABLED = True
-    logging.info("Disabilitato il controllo di allineamento/repetition guard del modello multilingue.")
+    logging.info("Alignment guard non applicabile: worker v3 usa solo Qwen3-TTS.")
 
 sample_rate = 24000
 CHAPTER_MANIFEST_FILENAME = "chapter_exports.json"
-TTS_ENGINE = os.getenv("CHATTERBLEZ_TTS_ENGINE", "chatterbox").strip().lower()
-AZZURRA_MODEL_ID = os.getenv("CHATTERBLEZ_AZZURRA_MODEL", "cartesia/azzurra-voice")
-_AZZURRA_CACHE: Dict[str, Any] = {"processor": None, "model": None, "device": None}
+TTS_ENGINE = os.getenv("CHATTERBLEZ_TTS_ENGINE", "qwen3_5").strip().lower()
 _TTS_RESOURCE_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
-CSM_BINARY = os.getenv("CHATTERBLEZ_CSM_BINARY", "csm.rs")
-CSM_MODEL_ID = os.getenv("CHATTERBLEZ_CSM_MODEL", "cartesia/azzurra-voice")
-CSM_EXTRA_ARGS = os.getenv("CHATTERBLEZ_CSM_EXTRA_ARGS", "")
+QWEN_MODEL_ID = os.getenv("CHATTERBLEZ_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").strip()
+QWEN_SPEAKER_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_SPEAKER", "Serena").strip() or "Serena"
+QWEN_INSTRUCT_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_INSTRUCT", "").strip()
+QWEN_ATTN_IMPL = os.getenv("CHATTERBLEZ_QWEN_ATTN_IMPL", "flash_attention_2").strip()
+QWEN_DTYPE = os.getenv("CHATTERBLEZ_QWEN_DTYPE", "float16").strip().lower()
+_QWEN_CACHE: Dict[str, Any] = {"model": None}
 # Default chunk sizes for TTS batching. Smaller chunks reduce the chance that
 # the model emits an early EOS and drops part of a sentence.
 BATCH_MIN_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "120"))
@@ -193,67 +166,83 @@ def get_tts_engine_name() -> str:
     return _resolve_tts_engine()
 
 
-def ensure_azzurra_available() -> None:
-    if AutoProcessor is None or CsmForConditionalGeneration is None:
-        raise RuntimeError(
-            "Il motore Azzurra richiede il pacchetto 'transformers'. Installalo per usare CHATTERBLEZ_TTS_ENGINE=azzurra."
-        )
-
-
-def load_azzurra_resources() -> Dict[str, Any]:
-    ensure_azzurra_available()
-    if _AZZURRA_CACHE["model"] is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        processor = AutoProcessor.from_pretrained(AZZURRA_MODEL_ID)
-        model = CsmForConditionalGeneration.from_pretrained(AZZURRA_MODEL_ID).to(device)
-        _AZZURRA_CACHE["processor"] = processor
-        _AZZURRA_CACHE["model"] = model
-        _AZZURRA_CACHE["device"] = device
-    return {
-        "engine": "azzurra",
-        "processor": _AZZURRA_CACHE["processor"],
-        "model": _AZZURRA_CACHE["model"],
-        "device": _AZZURRA_CACHE["device"],
+def map_language_id_to_qwen(language_id: str | None) -> str:
+    if not language_id:
+        return "Auto"
+    lang = str(language_id).strip().lower()
+    mapping = {
+        "auto": "Auto",
+        "it": "Italian",
+        "ita": "Italian",
+        "italian": "Italian",
+        "en": "English",
+        "eng": "English",
+        "english": "English",
+        "zh": "Chinese",
+        "zh-cn": "Chinese",
+        "chinese": "Chinese",
+        "es": "Spanish",
+        "spanish": "Spanish",
+        "fr": "French",
+        "french": "French",
+        "de": "German",
+        "german": "German",
+        "pt": "Portuguese",
+        "portuguese": "Portuguese",
+        "ru": "Russian",
+        "russian": "Russian",
+        "ja": "Japanese",
+        "japanese": "Japanese",
+        "ko": "Korean",
+        "korean": "Korean",
     }
+    return mapping.get(lang, "Auto")
 
 
-def load_chatterbox_resources(use_multilingual: bool) -> Dict[str, Any]:
-    try:
-        from chatterbox.tts import ChatterboxTTS
-    except ImportError as exc:
-        raise RuntimeError(
-            "Il motore Chatterbox non è installato in questo ambiente. "
-            "Installa chatterbox-tts oppure usa CHATTERBLEZ_TTS_ENGINE=azzurra."
-        ) from exc
-    if use_multilingual and ChatterboxMultilingualTTS is None:
-        raise RuntimeError(
-            "chatterbox.mtl_tts non è disponibile: installa chatterbox-tts per usare il motore multilingue."
-        )
+def resample_audio_linear(wav: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if src_rate <= 0 or src_rate == dst_rate or wav.size == 0:
+        return wav.astype(np.float32, copy=False)
+    src = np.asarray(wav, dtype=np.float32).flatten()
+    duration = len(src) / float(src_rate)
+    target_len = max(1, int(round(duration * float(dst_rate))))
+    x_old = np.linspace(0.0, 1.0, num=len(src), endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+    return np.interp(x_new, x_old, src).astype(np.float32)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if use_multilingual:
-        model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-    else:
-        model = ChatterboxTTS.from_pretrained(device=device)
+
+def load_qwen_resources() -> Dict[str, Any]:
+    if Qwen3TTSModel is None:
+        raise RuntimeError("qwen-tts non installato. Installa il pacchetto per usare il worker qwen3_5.")
+    if _QWEN_CACHE["model"] is None:
+        from_pretrained_kwargs: Dict[str, Any] = {}
+        if torch.cuda.is_available():
+            from_pretrained_kwargs["device_map"] = "cuda:0"
+            from_pretrained_kwargs["dtype"] = (
+                torch.bfloat16 if QWEN_DTYPE in {"bf16", "bfloat16"} else torch.float16
+            )
+            if QWEN_ATTN_IMPL:
+                from_pretrained_kwargs["attn_implementation"] = QWEN_ATTN_IMPL
+        else:
+            from_pretrained_kwargs["device_map"] = "cpu"
+        try:
+            _QWEN_CACHE["model"] = Qwen3TTSModel.from_pretrained(
+                QWEN_MODEL_ID,
+                **from_pretrained_kwargs,
+            )
+        except Exception as exc:
+            if from_pretrained_kwargs.pop("attn_implementation", None):
+                logging.warning("Qwen3-TTS fallback senza flash attention: %s", exc)
+                _QWEN_CACHE["model"] = Qwen3TTSModel.from_pretrained(
+                    QWEN_MODEL_ID,
+                    **from_pretrained_kwargs,
+                )
+            else:
+                raise
     return {
-        "engine": "chatterbox",
-        "model": model,
-        "device": device,
-        "use_multilingual": use_multilingual,
-    }
-
-
-def load_csm_resources() -> Dict[str, Any]:
-    if shutil.which(CSM_BINARY) is None:
-        raise RuntimeError(
-            f"Impossibile trovare il binario '{CSM_BINARY}'. "
-            "Installa csm.rs e imposta CHATTERBLEZ_CSM_BINARY se necessario."
-        )
-    return {
-        "engine": "csm",
-        "binary": CSM_BINARY,
-        "model_id": CSM_MODEL_ID,
-        "extra_args": CSM_EXTRA_ARGS,
+        "engine": "qwen",
+        "model": _QWEN_CACHE["model"],
+        "speaker": QWEN_SPEAKER_DEFAULT,
+        "instruct": QWEN_INSTRUCT_DEFAULT or None,
     }
 
 
@@ -262,85 +251,65 @@ def load_tts_resources(use_multilingual: bool, cache: bool = False) -> Dict[str,
     key = (engine, use_multilingual)
     if cache and key in _TTS_RESOURCE_CACHE:
         return _TTS_RESOURCE_CACHE[key]
-    if engine == "azzurra":
-        resources = load_azzurra_resources()
-    elif engine == "csm":
-        resources = load_csm_resources()
-    else:
-        resources = load_chatterbox_resources(use_multilingual)
+    if engine not in {"qwen3_5", "qwen", "qwen3.5"}:
+        raise RuntimeError(
+            f"Worker qwen3_5 supporta solo CHATTERBLEZ_TTS_ENGINE=qwen3_5 (ricevuto: '{engine}')."
+        )
+    resources = load_qwen_resources()
     if cache:
         _TTS_RESOURCE_CACHE[key] = resources
     return resources
 
 
-def synthesize_with_azzurra(
+def synthesize_with_qwen(
     tts_resources: Dict[str, Any],
     text: str,
-    temperature: float,
-    top_p: float,
-    repetition_penalty: float,
+    *,
+    language_id: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    repetition_penalty: float | None = None,
     top_k: int | None = None,
-):
-    processor = tts_resources["processor"]
+    speaker: str | None = None,
+) -> np.ndarray:
     model = tts_resources["model"]
-    device = tts_resources["device"]
-    conversation = [{"role": "user", "content": [{"type": "text", "text": text}]}]
-    inputs = processor.apply_chat_template(
-        conversation,
-        tokenize=True,
-        return_dict=True,
-    ).to(device)
-    generation_kwargs = {
-        "temperature": float(temperature),
-        "top_p": float(top_p),
-        "repetition_penalty": float(repetition_penalty),
-    }
+    selected_speaker = (speaker or tts_resources.get("speaker") or QWEN_SPEAKER_DEFAULT).strip()
+    try:
+        supported_speakers = model.get_supported_speakers()
+    except Exception:
+        supported_speakers = []
+    if supported_speakers and selected_speaker not in set(supported_speakers):
+        logging.warning(
+            "Speaker '%s' non supportato dal modello. Uso '%s'.",
+            selected_speaker,
+            supported_speakers[0],
+        )
+        selected_speaker = supported_speakers[0]
+    generation_kwargs: Dict[str, Any] = {}
+    if temperature is not None:
+        generation_kwargs["temperature"] = float(temperature)
+    if top_p is not None:
+        generation_kwargs["top_p"] = float(top_p)
+    if repetition_penalty is not None:
+        generation_kwargs["repetition_penalty"] = float(repetition_penalty)
     if top_k is not None:
         generation_kwargs["top_k"] = int(top_k)
-    audio_output = model.generate(**inputs, output_audio=True, **generation_kwargs)
-    waveform = audio_output[0].to("cpu").numpy()
-    return waveform
-
-
-def synthesize_with_csm(
-    tts_resources: Dict[str, Any], text: str, *, temperature: float | None = None
-) -> np.ndarray:
-    binary = tts_resources["binary"]
-    model_id = tts_resources["model_id"]
-    extra = tts_resources.get("extra_args") or ""
-    extra_args = shlex.split(extra)
-    if "-A" in extra_args:  # csm.rs non supporta '-A' (capitato su runpod)
-        logging.warning("Rimuovo argomento CSM non valido '-A' da CHATTERBLEZ_CSM_EXTRA_ARGS.")
-        extra_args = [arg for arg in extra_args if arg != "-A"]
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        output_file = tmp_path / "output.wav"
-        cmd = [
-            binary,
-            "--model-id",
-            model_id,
-            "--text",
-            text,
-            "--output",
-            str(output_file),
-        ]
-        if temperature is not None:
-            cmd.extend(["--temperature", f"{float(temperature):.6f}"])
-        cmd.extend(extra_args)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                "Il processo csm.rs è terminato con errore:\n"
-                f"{result.stdout}\n{result.stderr}"
-            )
-        if not output_file.exists():
-            raise RuntimeError("csm.rs non ha prodotto il file audio atteso.")
-        data, sr = soundfile.read(output_file)
-        if sr != sample_rate:
-            logging.warning(
-                "Sample rate inatteso da csm.rs (%s). Atteso: %s", sr, sample_rate
-            )
-        return np.asarray(data, dtype=np.float32).flatten()
+    language = map_language_id_to_qwen(language_id)
+    instruct = tts_resources.get("instruct")
+    wavs, sr = model.generate_custom_voice(
+        text=text,
+        language=language,
+        speaker=selected_speaker,
+        instruct=instruct,
+        **generation_kwargs,
+    )
+    if not wavs:
+        raise RuntimeError("Qwen3-TTS non ha prodotto alcun output audio.")
+    wav = np.asarray(wavs[0], dtype=np.float32).flatten()
+    if int(sr) != sample_rate:
+        logging.warning("Sample rate inatteso da Qwen3-TTS (%s). Resample a %s.", sr, sample_rate)
+        wav = resample_audio_linear(wav, int(sr), sample_rate)
+    return wav
 
 
 import string
@@ -882,7 +851,7 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
             logging.StreamHandler()
         ]
     )
-    logging.getLogger('chatterbox').setLevel(logging.WARNING)
+    logging.getLogger('qwen_tts').setLevel(logging.WARNING)
     params = {
         "repetition_penalty":repetition_penalty,
         "min_p":min_p,
@@ -1073,19 +1042,10 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
     engine_name = tts_resources["engine"]
     logging.info(f'Using TTS engine: {engine_name}')
 
-    if engine_name == "chatterbox":
-        if use_multilingual and disable_alignment_guard:
-            disable_alignment_guard_checks()
-        cb_model = tts_resources["model"]
-        if audio_prompt_wav:
-            try:
-                cb_model.prepare_conditionals(wav_fpath=audio_prompt_wav)
-            except AttributeError:
-                logging.debug("prepare_conditionals not available; relying on audio_prompt_path in generate()")
-    else:
-        if audio_prompt_wav:
-            logging.warning("Audio prompt non supportato con il motore Azzurra; verrà ignorato.")
-        cb_model = None  # Not used, kept for compatibility
+    if disable_alignment_guard and use_multilingual:
+        disable_alignment_guard_checks()
+    if audio_prompt_wav:
+        logging.warning("Audio prompt non supportato con il motore %s; verrà ignorato.", engine_name)
 
     nlp = get_nlp()
     for i, chapter in enumerate(selected_chapters, start=1):
@@ -1418,8 +1378,7 @@ def gen_audio_segments(
     if should_stop is None:
         should_stop = lambda: False
 
-    engine = tts_resources.get("engine", "chatterbox")
-    cb_model = tts_resources.get("model")
+    engine = tts_resources.get("engine", "qwen")
 
     doc = nlp(text)
     sentences = list(doc.sents)
@@ -1453,47 +1412,18 @@ def gen_audio_segments(
             continue
 
 
-        if engine == "azzurra":
-            wav_array = synthesize_with_azzurra(
-                tts_resources,
-                batch_text,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                top_k=top_k,
-            )
-            yield wav_array
-        elif engine == "csm":
-            wav_array = synthesize_with_csm(
-                tts_resources,
-                batch_text,
-                temperature=temperature,
-            )
-            yield wav_array
-        elif use_multilingual:
-            wav = cb_model.generate(
-                batch_text,
-                language_id=language_id or 'en',
-                audio_prompt_path=audio_prompt_wav,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-                temperature=temperature
-            )
-            yield wav.numpy().flatten()
-        else:
-            wav = cb_model.generate(
-                batch_text,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-                temperature=temperature
-            )
-            yield wav.numpy().flatten()
+        if engine != "qwen":
+            raise RuntimeError(f"Engine non supportato su worker_v3_qwen3_5tts: {engine}")
+        wav_array = synthesize_with_qwen(
+            tts_resources,
+            batch_text,
+            language_id=language_id,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            top_k=top_k,
+        )
+        yield wav_array
 
         gap_duration = 0
         if force_sentence_gaps:

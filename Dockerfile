@@ -1,14 +1,9 @@
 ARG BASE_IMAGE=runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
 
-ARG CUDA_COMPUTE_CAP=86
-
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# Avoid bindgen_cuda probing nvidia-smi during build (set per target GPU if needed)
-ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 WORKDIR /workspace/Chatterblez_FINITIO
 
@@ -21,13 +16,14 @@ RUN apt-get update \
         git \
         curl \
         ca-certificates \
-        pkg-config \
-        libssl-dev \
         libsndfile1 \
+        sox \
     && rm -rf /var/lib/apt/lists/*
 
-RUN chmod +x install_azzurra.sh \
-    && SKIP_FFMPEG=1 SKIP_TORCH=1 USE_SYSTEM_SITE_PACKAGES=1 ./install_azzurra.sh
+RUN python3 -m venv --system-site-packages .venv-qwen \
+    && . .venv-qwen/bin/activate \
+    && python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install -r requirements_qwen.txt
 
 RUN chmod +x start_worker.sh
 

@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/chatterblez-worker
+  IMAGE_NAME: ${{ github.repository_owner }}/worker-v3-qwen3-5tts
 
 jobs:
   build-and-push-image:
