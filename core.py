@@ -1494,6 +1494,14 @@ def gen_audio_segments(
             top_k=top_k,
         )
         yield wav_array
+        current_batch = i + 1
+        remaining_batches = max(0, total_batches - current_batch)
+        logging.info(
+            "CHUNK_PROGRESS current=%s total=%s remaining=%s",
+            current_batch,
+            total_batches,
+            remaining_batches,
+        )
 
         gap_duration = 0
         if force_sentence_gaps:

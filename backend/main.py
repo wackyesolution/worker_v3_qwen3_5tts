@@ -20,7 +20,7 @@ from datetime import datetime
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import (
@@ -69,6 +69,7 @@ MAX_LOG_LINES = 10000
 
 SUPPORTED_EXTS = {".pdf", ".epub", ".txt"}
 RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}(?:_preview)?$")
+CHUNK_PROGRESS_RE = re.compile(r"CHUNK_PROGRESS current=(\d+) total=(\d+) remaining=(\d+)")
 ARTIFACT_KINDS = {
     ".m4a": "wav",
     ".wav": "wav",
@@ -147,6 +148,22 @@ class TrialRequest(VoiceTestRequest):
     pass
 
 
+class HeartbeatState:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: Dict[str, Any] = {}
+
+    def update(self, **kwargs: Any) -> None:
+        with self._lock:
+            for key, value in kwargs.items():
+                if value is not None:
+                    self._state[key] = value
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._state)
+
+
 # Central HTTP client for internal endpoints (job info, heartbeat, artifacts).
 class CentralClient:
     def __init__(self, base_url: str, token: str, timeout: int = WORKER_REQUEST_TIMEOUT):
@@ -180,10 +197,26 @@ class CentralClient:
     def get_job_info(self, job_id: int) -> Dict[str, Any]:
         return self.request("GET", f"/internal/jobs/{job_id}").json()
 
-    def heartbeat(self, job_id: int, message: Optional[str] = None) -> None:
+    def heartbeat(
+        self,
+        job_id: int,
+        message: Optional[str] = None,
+        progress: Optional[float] = None,
+        chunk_current: Optional[int] = None,
+        chunk_total: Optional[int] = None,
+        chunks_remaining: Optional[int] = None,
+    ) -> None:
         payload: Dict[str, Any] = {}
         if message:
             payload["message"] = message
+        if progress is not None:
+            payload["progress"] = float(progress)
+        if chunk_current is not None:
+            payload["chunk_current"] = int(chunk_current)
+        if chunk_total is not None:
+            payload["chunk_total"] = int(chunk_total)
+        if chunks_remaining is not None:
+            payload["chunks_remaining"] = int(chunks_remaining)
         self.request("POST", f"/internal/jobs/{job_id}/heartbeat", json=payload)
 
     def complete(
@@ -681,6 +714,25 @@ def tail_lines(path: Path, limit: int = 30) -> List[str]:
     return lines[-limit:]
 
 
+def extract_chunk_progress_from_log(path: Path) -> Optional[Dict[str, Any]]:
+    for line in reversed(tail_lines(path, 120)):
+        match = CHUNK_PROGRESS_RE.search(line or "")
+        if not match:
+            continue
+        chunk_current = int(match.group(1))
+        chunk_total = max(1, int(match.group(2)))
+        chunks_remaining = max(0, int(match.group(3)))
+        progress = max(0.0, min(100.0, (chunk_current / float(chunk_total)) * 100.0))
+        return {
+            "chunk_current": chunk_current,
+            "chunk_total": chunk_total,
+            "chunks_remaining": chunks_remaining,
+            "progress": progress,
+            "message": f"chunk {chunk_current}/{chunk_total}",
+        }
+    return None
+
+
 def trim_log_file(path: Path, retain_lines: int = MAX_LOG_LINES) -> None:
     """Truncate a log file to at most `retain_lines` lines, keeping the newest ones."""
     if retain_lines <= 0:
@@ -861,6 +913,7 @@ def run_pipeline(
     run_id_override: Optional[str] = None,
     preview_mode: bool = False,
     max_preview_words: Optional[int] = None,
+    on_chunk_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     # This calls PRE_SERVER which handles ffmpeg/whisper/azzurra/csm end-to-end.
@@ -977,6 +1030,7 @@ def run_pipeline(
             "log_path": str(log_path),
         }
         retcode = -1
+        last_progress_signature: Optional[Tuple[int, int, int]] = None
         try:
             with log_path.open("w", encoding="utf-8") as log_handle:
                 process = subprocess.Popen(
@@ -987,7 +1041,23 @@ def run_pipeline(
                 )
                 CURRENT_JOB = job_info
                 CURRENT_JOB_PROCESS = process
-                retcode = process.wait()
+                while True:
+                    polled = process.poll()
+                    progress_payload = extract_chunk_progress_from_log(log_path)
+                    if progress_payload:
+                        signature = (
+                            int(progress_payload.get("chunk_current") or 0),
+                            int(progress_payload.get("chunk_total") or 0),
+                            int(progress_payload.get("chunks_remaining") or 0),
+                        )
+                        if signature != last_progress_signature:
+                            last_progress_signature = signature
+                            if on_chunk_progress:
+                                on_chunk_progress(progress_payload)
+                    if polled is not None:
+                        retcode = int(polled)
+                        break
+                    time.sleep(1.0)
         finally:
             CURRENT_JOB = None
             CURRENT_JOB_PROCESS = None
@@ -1119,10 +1189,20 @@ def heartbeat_loop(
     job_id: int,
     stop_event: threading.Event,
     interval_seconds: int,
+    state: HeartbeatState,
 ) -> None:
-    while not stop_event.wait(timeout=max(1, interval_seconds)):
+    pulse_seconds = max(1, min(max(1, interval_seconds), 20))
+    while not stop_event.wait(timeout=pulse_seconds):
         try:
-            client.heartbeat(job_id)
+            snapshot = state.snapshot()
+            client.heartbeat(
+                job_id,
+                message=snapshot.get("message"),
+                progress=snapshot.get("progress"),
+                chunk_current=snapshot.get("chunk_current"),
+                chunk_total=snapshot.get("chunk_total"),
+                chunks_remaining=snapshot.get("chunks_remaining"),
+            )
         except Exception as exc:  # pragma: no cover - best effort
             logging.warning("Heartbeat failed for job %s: %s", job_id, exc)
 
@@ -1144,7 +1224,9 @@ def run_worker_job(
     input_filename = job_info.get("input_filename") or f"book_{book_id}.pdf"
     ext = Path(input_filename).suffix or ".pdf"
 
+    heartbeat_state = HeartbeatState()
     client.heartbeat(job_id, "worker-started")
+    heartbeat_state.update(message="worker-running")
 
     folders = user_folders(username)
     import_path = folders["import"] / f"book_{book_id}{ext}"
@@ -1169,7 +1251,7 @@ def run_worker_job(
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(
         target=heartbeat_loop,
-        args=(client, job_id, stop_event, heartbeat_interval),
+        args=(client, job_id, stop_event, heartbeat_interval, heartbeat_state),
         daemon=True,
     )
     heartbeat_thread.start()
@@ -1177,6 +1259,28 @@ def run_worker_job(
     status_value = "failed"
     error_message: Optional[str] = None
     artifacts: Optional[List[Dict[str, str]]] = None
+    last_progress_push_at = 0.0
+
+    def on_chunk_progress(progress_payload: Dict[str, Any]) -> None:
+        nonlocal last_progress_push_at
+        heartbeat_state.update(**progress_payload)
+        now = time.monotonic()
+        if now - last_progress_push_at < 5.0:
+            return
+        snapshot = heartbeat_state.snapshot()
+        try:
+            client.heartbeat(
+                job_id,
+                message=snapshot.get("message"),
+                progress=snapshot.get("progress"),
+                chunk_current=snapshot.get("chunk_current"),
+                chunk_total=snapshot.get("chunk_total"),
+                chunks_remaining=snapshot.get("chunks_remaining"),
+            )
+            last_progress_push_at = now
+        except Exception as exc:  # pragma: no cover - best effort
+            logging.warning("Chunk progress heartbeat failed for job %s: %s", job_id, exc)
+
     try:
         result = run_pipeline(
             book_row,
@@ -1184,6 +1288,7 @@ def run_worker_job(
             run_id_override=run_id,
             preview_mode=preview_mode,
             max_preview_words=max_preview_words or 2200,
+            on_chunk_progress=on_chunk_progress,
             **pipeline_kwargs,
         )
         artifacts = result.get("artifacts") if isinstance(result, dict) else None
