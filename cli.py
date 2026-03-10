@@ -36,15 +36,15 @@ def cli_main():
     parser.add_argument('--keep-silence', type=int, default=100, help='The amount of silence to leave at the beginning and end of the trimmed audio.')
 
     # Model parameters
-    parser.add_argument('--repetition-penalty', type=float, default=1.1, help='Repetition penalty (default: 1.1)')
-    parser.add_argument('--min-p', type=float, default=0.02, help='Min P for sampling (default: 0.02)')
-    parser.add_argument('--top-p', type=float, default=0.95, help='Top P for sampling (default: 0.95)')
+    parser.add_argument('--repetition-penalty', type=float, default=None, help='Optional override; if omitted uses checkpoint defaults.')
+    parser.add_argument('--min-p', type=float, default=None, help='Optional override; if omitted uses checkpoint defaults.')
+    parser.add_argument('--top-p', type=float, default=None, help='Optional override; if omitted uses checkpoint defaults.')
     parser.add_argument('--top-k', type=int, help='Top K for sampling (Azzurra only)')
-    parser.add_argument('--exaggeration', type=float, default=0.4, help='Exaggeration factor (default: 0.4)')
-    parser.add_argument('--cfg-weight', type=float, default=0.8, help='CFG weight (default: 0.8)')
-    parser.add_argument('--temperature', type=float, default=0.85, help='Temperature for sampling (default: 0.85)')
+    parser.add_argument('--exaggeration', type=float, default=None, help='Legacy override (ignored by Qwen when omitted).')
+    parser.add_argument('--cfg-weight', type=float, default=None, help='Legacy override (ignored by Qwen when omitted).')
+    parser.add_argument('--temperature', type=float, default=None, help='Optional override; if omitted uses checkpoint defaults.')
     parser.add_argument('--use-multilingual', action='store_true', help='Use the multilingual Chatterbox model (default: disabled)')
-    parser.add_argument('--language-id', default='en', help='Language ID passed to the multilingual model (default: en)')
+    parser.add_argument('--language-id', default=None, help='Language id (e.g. it). If omitted, Qwen uses Auto.')
     parser.add_argument(
         '--sentence-gap-ms',
         type=int,

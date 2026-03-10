@@ -55,7 +55,7 @@ QWEN_MODEL_ID = os.getenv("CHATTERBLEZ_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Cu
 QWEN_SPEAKER_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_SPEAKER", "Serena").strip() or "Serena"
 QWEN_INSTRUCT_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_INSTRUCT", "").strip()
 QWEN_ATTN_IMPL = os.getenv("CHATTERBLEZ_QWEN_ATTN_IMPL", "flash_attention_2").strip()
-QWEN_DTYPE = os.getenv("CHATTERBLEZ_QWEN_DTYPE", "float16").strip().lower()
+QWEN_DTYPE = os.getenv("CHATTERBLEZ_QWEN_DTYPE", "auto").strip().lower()
 _QWEN_CACHE: Dict[str, Any] = {"model": None}
 # Default chunk sizes for TTS batching. Smaller chunks reduce the chance that
 # the model emits an early EOS and drops part of a sentence.
@@ -208,20 +208,77 @@ def resample_audio_linear(wav: np.ndarray, src_rate: int, dst_rate: int) -> np.n
     return np.interp(x_new, x_old, src).astype(np.float32)
 
 
+def _resolve_qwen_cuda_dtype() -> Tuple[Any, str]:
+    requested = QWEN_DTYPE or "auto"
+    if requested in {"auto"}:
+        bf16_supported = bool(
+            torch.cuda.is_available()
+            and hasattr(torch.cuda, "is_bf16_supported")
+            and torch.cuda.is_bf16_supported()
+        )
+        if bf16_supported:
+            return torch.bfloat16, "bfloat16(auto)"
+        return torch.float16, "float16(auto-fallback)"
+    if requested in {"bf16", "bfloat16"}:
+        bf16_supported = bool(
+            torch.cuda.is_available()
+            and hasattr(torch.cuda, "is_bf16_supported")
+            and torch.cuda.is_bf16_supported()
+        )
+        if not bf16_supported:
+            logging.warning(
+                "CHATTERBLEZ_QWEN_DTYPE=%s ma GPU senza supporto bf16; fallback a float16.",
+                requested,
+            )
+            return torch.float16, "float16(bf16-unsupported-fallback)"
+        return torch.bfloat16, "bfloat16"
+    if requested in {"fp16", "float16", "half"}:
+        return torch.float16, "float16"
+    if requested in {"fp32", "float32", "full"}:
+        return torch.float32, "float32"
+    logging.warning("CHATTERBLEZ_QWEN_DTYPE sconosciuto '%s'; uso auto.", requested)
+    bf16_supported = bool(
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "is_bf16_supported")
+        and torch.cuda.is_bf16_supported()
+    )
+    if bf16_supported:
+        return torch.bfloat16, "bfloat16(auto-fallback)"
+    return torch.float16, "float16(auto-fallback)"
+
+
+def _is_qwen_sampling_instability(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return (
+        "probability tensor contains either" in text
+        or ("nan" in text and "probability" in text)
+        or ("inf" in text and "probability" in text)
+    )
+
+
 def load_qwen_resources() -> Dict[str, Any]:
     if Qwen3TTSModel is None:
         raise RuntimeError("qwen-tts non installato. Installa il pacchetto per usare il worker qwen3_5.")
     if _QWEN_CACHE["model"] is None:
         from_pretrained_kwargs: Dict[str, Any] = {}
         if torch.cuda.is_available():
+            cuda_dtype, dtype_name = _resolve_qwen_cuda_dtype()
             from_pretrained_kwargs["device_map"] = "cuda:0"
-            from_pretrained_kwargs["dtype"] = (
-                torch.bfloat16 if QWEN_DTYPE in {"bf16", "bfloat16"} else torch.float16
-            )
+            from_pretrained_kwargs["dtype"] = cuda_dtype
             if QWEN_ATTN_IMPL:
                 from_pretrained_kwargs["attn_implementation"] = QWEN_ATTN_IMPL
+            logging.info(
+                "Loading Qwen3-TTS model=%s device=cuda:0 dtype=%s attn=%s",
+                QWEN_MODEL_ID,
+                dtype_name,
+                QWEN_ATTN_IMPL or "default",
+            )
         else:
             from_pretrained_kwargs["device_map"] = "cpu"
+            logging.info(
+                "Loading Qwen3-TTS model=%s device=cpu dtype=default",
+                QWEN_MODEL_ID,
+            )
         try:
             _QWEN_CACHE["model"] = Qwen3TTSModel.from_pretrained(
                 QWEN_MODEL_ID,
@@ -294,16 +351,33 @@ def synthesize_with_qwen(
         generation_kwargs["top_k"] = int(top_k)
     language = map_language_id_to_qwen(language_id)
     instruct = tts_resources.get("instruct")
-    wavs, sr = model.generate_custom_voice(
-        text=text,
-        language=language,
-        speaker=selected_speaker,
-        instruct=instruct,
-        **generation_kwargs,
-    )
+    try:
+        wavs, sr = model.generate_custom_voice(
+            text=text,
+            language=language,
+            speaker=selected_speaker,
+            instruct=instruct,
+            **generation_kwargs,
+        )
+    except RuntimeError as exc:
+        if generation_kwargs and _is_qwen_sampling_instability(exc):
+            logging.warning(
+                "Qwen sampling instabile con kwargs=%s; retry con default del checkpoint.",
+                generation_kwargs,
+            )
+            wavs, sr = model.generate_custom_voice(
+                text=text,
+                language=language,
+                speaker=selected_speaker,
+                instruct=instruct,
+            )
+        else:
+            raise
     if not wavs:
         raise RuntimeError("Qwen3-TTS non ha prodotto alcun output audio.")
     wav = np.asarray(wavs[0], dtype=np.float32).flatten()
+    wav = np.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0)
+    wav = np.clip(wav, -1.0, 1.0)
     if int(sr) != sample_rate:
         logging.warning("Sample rate inatteso da Qwen3-TTS (%s). Resample a %s.", sr, sample_rate)
         wav = resample_audio_linear(wav, int(sr), sample_rate)

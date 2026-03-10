@@ -128,16 +128,16 @@ class ProcessOptions(BaseModel):
 
 class VoiceTestRequest(BaseModel):
     text: str
-    repetition_penalty: float = 1.1
-    min_p: float = 0.02
-    top_p: float = 0.95
-    exaggeration: float = 0.4
-    cfg_weight: float = 0.8
-    temperature: float = 0.85
+    repetition_penalty: Optional[float] = None
+    min_p: Optional[float] = None
+    top_p: Optional[float] = None
+    exaggeration: Optional[float] = None
+    cfg_weight: Optional[float] = None
+    temperature: Optional[float] = None
     top_k: Optional[int] = None
     speed: float = 1.0
     use_multilingual: bool = False
-    language_id: str = "en"
+    language_id: Optional[str] = "it"
     sentence_gap_ms: Optional[int] = None
     question_gap_ms: Optional[int] = None
     disable_cleaning: bool = False
@@ -1488,14 +1488,8 @@ def trial_text(payload: TrialRequest):
 def example_use_test():
     sample_payload = {
         "text": "Ciao! Questa è una prova veloce della tua voce virtuale.",
-        "repetition_penalty": 1.05,
-        "min_p": 0.02,
-        "top_p": 0.92,
-        "exaggeration": 0.4,
-        "cfg_weight": 0.32,
-        "temperature": 0.9,
-        "speed": 0.95,
-        "use_multilingual": True,
+        "speed": 1.0,
+        "use_multilingual": False,
         "language_id": "it",
     }
     curl_example = (

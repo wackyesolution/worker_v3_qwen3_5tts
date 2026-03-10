@@ -24,20 +24,11 @@ OUTPUT_BASE = SCRIPT_DIR / "DD_Output"
 COLLECTION_DIR = SCRIPT_DIR / "audioBook"
 CHAPTER_MANIFEST = "chapter_exports.json"
 
-# Settings mirrored from convert_tzone.sh
+# Conservative defaults for Qwen worker:
+# leave sampling args unset so Qwen uses checkpoint generation_config defaults.
 CLI_ARGUMENTS = [
-    "--speed", "0.88",
-    "--repetition-penalty", "1.05",
-    "--min-p", "0.02",
-    "--top-p", "0.92",
-    "--exaggeration", "0.72",
-    "--cfg-weight", "0.32",
-    "--temperature", "0.92",
-    "--sentence-gap-ms", "350",
-    "--question-gap-ms", "1000",
-    "--use-multilingual",
+    "--speed", "1.0",
     "--language-id", "it",
-    "--disable-alignment-guard",
 ]
 
 
