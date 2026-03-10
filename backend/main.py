@@ -38,6 +38,11 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from ebooklib import epub
 
+# Make root-level modules (e.g. core.py) importable regardless of PYTHONPATH.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from core import (
     find_document_chapters_and_extract_texts,
     find_good_chapters,
@@ -47,14 +52,12 @@ from core import (
     get_nlp,
     gen_audio_segments,
     write_audio_stream,
-    sample_rate,
     clean_line,
     load_tts_resources,
     get_tts_engine_name,
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = PROJECT_ROOT / "backend"
 # Local sqlite is only to satisfy the legacy pipeline; Central is the source of truth.
 DB_PATH = BACKEND_ROOT / "backend.db"
@@ -1190,8 +1193,10 @@ def run_worker_job(
                 client.upload_artifact(job_id, artifact_path)
         status_value = "success"
     except HTTPException as exc:
+        logging.error("Worker job %s failed with HTTPException: %s", job_id, exc.detail)
         error_message = str(exc.detail)
     except Exception as exc:
+        logging.exception("Worker job %s raised an unhandled exception", job_id)
         error_message = str(exc)
     finally:
         stop_event.set()
@@ -1428,13 +1433,13 @@ def trial_text(payload: TrialRequest):
     if not TRIAL_MODE:
         raise HTTPException(status_code=404, detail="Trial mode non attivo su questo worker.")
     global trial_lock_started_at, trial_lock
+    acquired = False
     log_path = LOGS_DIR / f"trial_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     text_preview = (payload.text or "").replace("\n", " ")[:400]
     _append_trial_log(
         log_path,
         f"Request received (len={len(payload.text or '')}, disable_cleaning={payload.disable_cleaning}) preview=\"{text_preview}\"",
     )
-    _append_trial_log(log_path, f"Lock acquired={acquired}")
     # Se il lock è bloccato da troppo tempo, resettiamo per evitare stalli.
     max_lock_seconds = 300
     if trial_lock.locked() and trial_lock_started_at:
@@ -1444,6 +1449,7 @@ def trial_text(payload: TrialRequest):
             trial_lock = threading.Lock()
             trial_lock_started_at = 0.0
     acquired = trial_lock.acquire(blocking=False)
+    _append_trial_log(log_path, f"Lock acquired={acquired}")
     if not acquired:
         raise HTTPException(status_code=409, detail="è già in corso una prova.")
     trial_lock_started_at = time.time()
@@ -1576,8 +1582,8 @@ if __name__ == "__main__":
             raise SystemExit(f"Job ID non valido: {job_id_raw}")
         try:
             exit_code = run_worker_job(job_id, central_url, worker_token, heartbeat_interval)
-        except Exception as exc:
-            logging.error("Worker job failed: %s", exc)
+        except Exception:
+            logging.exception("Worker job failed")
             exit_code = 1
         raise SystemExit(exit_code)
 

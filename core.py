@@ -8,11 +8,9 @@ import logging
 import json
 import os
 import sys
-import traceback
 from glob import glob
 
 import torch
-import torch.cuda
 import spacy
 import ebooklib
 import soundfile
@@ -372,8 +370,6 @@ def load_spacy():
 
 
 import ctypes
-import time
-import threading
 
 # Constants from WinBase.h
 ES_CONTINUOUS = 0x80000000
