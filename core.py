@@ -57,10 +57,11 @@ QWEN_INSTRUCT_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_INSTRUCT", "").strip()
 QWEN_ATTN_IMPL = os.getenv("CHATTERBLEZ_QWEN_ATTN_IMPL", "flash_attention_2").strip()
 QWEN_DTYPE = os.getenv("CHATTERBLEZ_QWEN_DTYPE", "auto").strip().lower()
 _QWEN_CACHE: Dict[str, Any] = {"model": None}
-# Default chunk sizes for TTS batching. Smaller chunks reduce the chance that
-# the model emits an early EOS and drops part of a sentence.
+# Default chunk sizes for TTS batching.
+# Keep chunks reasonably small to avoid early EOS/truncation, but with the
+# lighter Qwen model we can afford a slightly larger max to reduce fragmentation.
 BATCH_MIN_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "120"))
-BATCH_MAX_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "360"))
+BATCH_MAX_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "420"))
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -594,7 +595,7 @@ def soften_double_quotes(text: str) -> str:
 # Step 2: Replace disallowed characters (keep basic Latin + common accents + speech punctuation/currency)
 # Allow basic punctuation plus parentheses; block everything else.
 # Added «» so we can preserve converted virgolette without being spelled out.
-non_allowed_re = re.compile(r"[^0-9A-Za-z\u00C0-\u017F\s.,'\"?!:;%€$-()«»]+")
+non_allowed_re = re.compile(r"[^0-9A-Za-z\u00C0-\u017F\s.,'\"?!:;%€$-(){}«»]+")
 
 # Step 3: Collapse multiple spaces
 space_re = re.compile(r'\s+')
