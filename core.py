@@ -61,10 +61,12 @@ _QWEN_CACHE: Dict[str, Any] = {"model": None}
 # Default chunk sizes for TTS batching.
 # Keep chunks reasonably small to avoid early EOS/truncation, but with the
 # lighter Qwen model we can afford a slightly larger max to reduce fragmentation.
-BATCH_MIN_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "240"))
-BATCH_MAX_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "560"))
+BATCH_MIN_CHARS = max(80, int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "360")))
+BATCH_MAX_CHARS = max(BATCH_MIN_CHARS, int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "960")))
 # Number of text batches sent in one Qwen generate call.
 QWEN_MICROBATCH_SIZE = max(1, int(os.getenv("CHATTERBLEZ_QWEN_MICROBATCH_SIZE", "2")))
+# Disabled dynamically if qwen-tts raises runtime errors for batched generation.
+_QWEN_MICROBATCH_DISABLED = False
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -1027,6 +1029,11 @@ def plan_batches_for_text(nlp, text: str, max_sentences: int | None = None) -> L
         min_chars=BATCH_MIN_CHARS,
         max_chars=BATCH_MAX_CHARS,
     )
+    batches = coalesce_short_batches(
+        batches,
+        min_chars=BATCH_MIN_CHARS,
+        max_chars=BATCH_MAX_CHARS,
+    )
     if max_sentences and int(max_sentences) > 0:
         batches = batches[: int(max_sentences)]
     return batches
@@ -1513,6 +1520,50 @@ def batch_sentences_intelligently(sentences, min_chars=BATCH_MIN_CHARS, max_char
     return batches
 
 
+def coalesce_short_batches(
+    batches: List[str],
+    *,
+    min_chars: int = BATCH_MIN_CHARS,
+    max_chars: int = BATCH_MAX_CHARS,
+) -> List[str]:
+    """
+    Merge adjacent tiny batches while keeping a strict `max_chars` cap.
+
+    This reduces the number of serial TTS calls when sentence segmentation
+    generates many short chunks.
+    """
+    if len(batches) < 2:
+        return [batch for batch in batches if (batch or "").strip()]
+
+    target_min = max(80, int(min_chars * 0.85))
+    merged: List[str] = []
+    i = 0
+    while i < len(batches):
+        current = (batches[i] or "").strip()
+        if not current:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(batches):
+            nxt = (batches[j + 1] or "").strip()
+            if not nxt:
+                j += 1
+                continue
+            # Stop merging when both sides are already "healthy".
+            if len(current) >= target_min and len(nxt) >= target_min:
+                break
+            projected = len(current) + 1 + len(nxt)
+            if projected > max_chars:
+                break
+            current = f"{current} {nxt}"
+            j += 1
+            if len(current) >= min_chars and current.endswith(('.', '!', '?', '"', "'")):
+                break
+        merged.append(current)
+        i = j + 1
+    return merged
+
+
 def find_cover(book):
     def is_image(item):
         return item is not None and item.media_type.startswith('image/')
@@ -1637,19 +1688,34 @@ def gen_audio_segments(
         min_chars=batch_min_chars,
         max_chars=batch_max_chars
     )
+    raw_batch_total = len(batches)
+    batches = coalesce_short_batches(
+        batches,
+        min_chars=batch_min_chars,
+        max_chars=batch_max_chars,
+    )
     if max_sentences and int(max_sentences) > 0:
         batches = batches[: int(max_sentences)]
 
+    global _QWEN_MICROBATCH_DISABLED
     total_batches = len(batches)
+    configured_microbatch_size = max(1, int(QWEN_MICROBATCH_SIZE))
+    effective_microbatch_size = 1 if _QWEN_MICROBATCH_DISABLED else configured_microbatch_size
     logging.info(
         "BATCH_CONFIG min_chars=%s max_chars=%s microbatch_size=%s sentence_gap_ms=%s question_gap_ms=%s force_sentence_gaps=%s",
         batch_min_chars,
         batch_max_chars,
-        QWEN_MICROBATCH_SIZE,
+        effective_microbatch_size,
         sentence_gap_ms,
         question_gap_ms,
         force_sentence_gaps,
     )
+    if raw_batch_total != len(batches):
+        logging.info(
+            "BATCH_COALESCE reduced_batches from=%s to=%s",
+            raw_batch_total,
+            len(batches),
+        )
     logging.info(f"Split {len(sentences)} sentences into {total_batches} batches")
 
     # Show some batch examples
@@ -1662,7 +1728,7 @@ def gen_audio_segments(
         raise RuntimeError(f"Engine non supportato su worker_v3_qwen3_5tts: {engine}")
 
     chunk_index = 0
-    microbatch_size = max(1, int(QWEN_MICROBATCH_SIZE))
+    microbatch_size = effective_microbatch_size
     while chunk_index < total_batches:
         if should_stop():
             logging.info("Synthesis interrupted by user (batch loop).")
@@ -1691,6 +1757,13 @@ def gen_audio_segments(
                 top_k=top_k,
             )
         except Exception as exc:
+            if len(texts) > 1 and not _QWEN_MICROBATCH_DISABLED:
+                _QWEN_MICROBATCH_DISABLED = True
+                microbatch_size = 1
+                logging.warning(
+                    "QWEN_MICROBATCH disabled for this worker process after runtime failure: %s",
+                    exc,
+                )
             logging.warning(
                 "QWEN_MICROBATCH fallback to single-call mode (size=%s): %s",
                 len(texts),
