@@ -36,11 +36,13 @@ from pydub.silence import split_on_silence
 from PyPDF2 import PdfReader
 try:
     from qwen_tts import Qwen3TTSModel
+    from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 except ImportError:  # optional until runtime image installs qwen-tts
     Qwen3TTSModel = None
+    Qwen3TTSConfig = None
 
 from functools import lru_cache
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple, List, Callable
 
 _ALIGNMENT_GUARD_DISABLED = True
 
@@ -67,6 +69,12 @@ BATCH_MAX_CHARS = max(BATCH_MIN_CHARS, int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHAR
 QWEN_MICROBATCH_SIZE = max(1, int(os.getenv("CHATTERBLEZ_QWEN_MICROBATCH_SIZE", "2")))
 # Disabled dynamically if qwen-tts raises runtime errors for batched generation.
 _QWEN_MICROBATCH_DISABLED = False
+QWEN_SDPA_ALIAS_PATCH_ENABLED = str(os.getenv("CHATTERBLEZ_QWEN_SDPA_ALIAS_PATCH", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+_QWEN_SDPA_ALIAS_PATCH_APPLIED = False
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -253,6 +261,36 @@ def _resolve_qwen_cuda_dtype() -> Tuple[Any, str]:
     return torch.float16, "float16(auto-fallback)"
 
 
+def _apply_dtype_to_nested_qwen_configs(config_obj: Any, dtype: Any, seen: set[int] | None = None) -> None:
+    """
+    Propagate dtype across nested qwen config objects (e.g. talker/code_predictor).
+    FA2 checks inspect each sub-config independently during model construction.
+    """
+    if config_obj is None:
+        return
+    if seen is None:
+        seen = set()
+    obj_id = id(config_obj)
+    if obj_id in seen:
+        return
+    seen.add(obj_id)
+    try:
+        config_obj.dtype = dtype
+    except Exception:
+        pass
+    for name in dir(config_obj):
+        if not name.endswith("_config") or name.startswith("__"):
+            continue
+        try:
+            child = getattr(config_obj, name)
+        except Exception:
+            continue
+        if child is None or callable(child):
+            continue
+        if hasattr(child, "__dict__"):
+            _apply_dtype_to_nested_qwen_configs(child, dtype, seen)
+
+
 def _is_qwen_sampling_instability(exc: BaseException) -> bool:
     text = str(exc or "").lower()
     return (
@@ -264,6 +302,84 @@ def _is_qwen_sampling_instability(exc: BaseException) -> bool:
 
 def _flash_attn_installed() -> bool:
     return importlib.util.find_spec("flash_attn") is not None
+
+
+def _maybe_patch_transformers_sdpa_aliasing() -> None:
+    """
+    Work around torch<2.5 + transformers sdpa mask aliasing:
+    the stock implementation performs an in-place `|=` on an expanded tensor.
+    With some batch shapes this raises:
+    "unsupported operation ... single memory location ... clone()".
+    """
+    global _QWEN_SDPA_ALIAS_PATCH_APPLIED
+    if _QWEN_SDPA_ALIAS_PATCH_APPLIED or not QWEN_SDPA_ALIAS_PATCH_ENABLED:
+        return
+    try:
+        import transformers  # type: ignore[import]
+        import transformers.masking_utils as masking_utils  # type: ignore[import]
+    except Exception as exc:
+        logging.debug("SDPA alias patch skipped (transformers import failed): %s", exc)
+        return
+
+    if getattr(masking_utils, "_is_torch_greater_or_equal_than_2_5", False):
+        _QWEN_SDPA_ALIAS_PATCH_APPLIED = True
+        return
+
+    original = getattr(masking_utils, "sdpa_mask_older_torch", None)
+    if not callable(original):
+        return
+    if getattr(original, "__name__", "") == "_chatterblez_sdpa_mask_older_torch_safe":
+        _QWEN_SDPA_ALIAS_PATCH_APPLIED = True
+        return
+
+    def _chatterblez_sdpa_mask_older_torch_safe(
+        batch_size: int,
+        cache_position: torch.Tensor,
+        kv_length: int,
+        kv_offset: int = 0,
+        mask_function: Callable = masking_utils.causal_mask_function,
+        attention_mask: torch.Tensor | None = None,
+        local_size: int | None = None,
+        allow_is_causal_skip: bool = True,
+        allow_torch_fix: bool = True,
+        **kwargs,
+    ) -> torch.Tensor | None:
+        q_length = cache_position.shape[0]
+        padding_mask = masking_utils.prepare_padding_mask(attention_mask, kv_length, kv_offset)
+
+        if allow_is_causal_skip and masking_utils._ignore_causal_mask_sdpa(
+            padding_mask, q_length, kv_length, kv_offset, local_size
+        ):
+            return None
+
+        kv_arange = torch.arange(kv_length, device=cache_position.device)
+        kv_arange += kv_offset
+
+        causal_mask = masking_utils._vmap_for_bhqkv(mask_function, bh_indices=False)(
+            None, None, cache_position, kv_arange
+        )
+        causal_mask = causal_mask[None, None, :, :].expand(batch_size, -1, -1, -1)
+
+        if padding_mask is not None:
+            causal_mask = causal_mask * padding_mask[:, None, None, :]
+
+        # Out-of-place OR avoids writes on expanded views with shared storage.
+        if not masking_utils._is_torch_greater_or_equal_than_2_5 and allow_torch_fix:
+            causal_mask = causal_mask | torch.all(~causal_mask, dim=-1, keepdim=True)
+        return causal_mask
+
+    masking_utils.sdpa_mask_older_torch = _chatterblez_sdpa_mask_older_torch_safe
+    try:
+        masking_utils.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] = _chatterblez_sdpa_mask_older_torch_safe
+    except Exception:
+        pass
+
+    _QWEN_SDPA_ALIAS_PATCH_APPLIED = True
+    logging.info(
+        "Applied transformers sdpa alias patch (transformers=%s, torch=%s).",
+        getattr(transformers, "__version__", "unknown"),
+        torch.__version__,
+    )
 
 
 def _log_qwen_runtime_diagnostics(model_wrapper: Any, dtype_name: str) -> None:
@@ -303,15 +419,29 @@ def _log_qwen_runtime_diagnostics(model_wrapper: Any, dtype_name: str) -> None:
 def load_qwen_resources() -> Dict[str, Any]:
     if Qwen3TTSModel is None:
         raise RuntimeError("qwen-tts non installato. Installa il pacchetto per usare il worker qwen3_5.")
+    _maybe_patch_transformers_sdpa_aliasing()
     if _QWEN_CACHE["model"] is None:
         from_pretrained_kwargs: Dict[str, Any] = {}
         dtype_name = "default(cpu)"
         if torch.cuda.is_available():
             cuda_dtype, dtype_name = _resolve_qwen_cuda_dtype()
             from_pretrained_kwargs["device_map"] = "cuda:0"
-            # Transformers/Flash-Attn expect torch_dtype; using "dtype" can be
-            # ignored by some versions and trigger the FA2 warning.
-            from_pretrained_kwargs["torch_dtype"] = cuda_dtype
+            if Qwen3TTSConfig is not None:
+                try:
+                    config = Qwen3TTSConfig.from_pretrained(QWEN_MODEL_ID, dtype=cuda_dtype)
+                    # Ensure dtype is already present on every nested config during
+                    # model init. FA2 checks inspect sub-configs independently.
+                    _apply_dtype_to_nested_qwen_configs(config, cuda_dtype)
+                    from_pretrained_kwargs["config"] = config
+                except Exception as exc:
+                    logging.warning(
+                        "Qwen config preload con dtype fallito; continuo senza config esplicita: %s",
+                        exc,
+                    )
+            # Transformers >=4.57 expects `dtype` (not `torch_dtype`).
+            # Passing `torch_dtype` emits a deprecation warning and may cause
+            # FA2 checks to think dtype is unset.
+            from_pretrained_kwargs["dtype"] = cuda_dtype
             if QWEN_ATTN_IMPL:
                 from_pretrained_kwargs["attn_implementation"] = QWEN_ATTN_IMPL
             logging.info(
