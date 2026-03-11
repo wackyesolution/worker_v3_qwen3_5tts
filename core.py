@@ -66,7 +66,7 @@ _QWEN_CACHE: Dict[str, Any] = {"model": None}
 BATCH_MIN_CHARS = max(80, int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "360")))
 BATCH_MAX_CHARS = max(BATCH_MIN_CHARS, int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "960")))
 # Number of text batches sent in one Qwen generate call.
-QWEN_MICROBATCH_SIZE = max(1, int(os.getenv("CHATTERBLEZ_QWEN_MICROBATCH_SIZE", "2")))
+QWEN_MICROBATCH_SIZE = max(1, int(os.getenv("CHATTERBLEZ_QWEN_MICROBATCH_SIZE", "9")))
 # Disabled dynamically if qwen-tts raises runtime errors for batched generation.
 _QWEN_MICROBATCH_DISABLED = False
 QWEN_SDPA_ALIAS_PATCH_ENABLED = str(os.getenv("CHATTERBLEZ_QWEN_SDPA_ALIAS_PATCH", "1")).strip().lower() not in {
