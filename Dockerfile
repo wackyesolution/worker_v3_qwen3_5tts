@@ -23,7 +23,8 @@ RUN apt-get update \
 RUN python3 -m venv --system-site-packages .venv-qwen \
     && . .venv-qwen/bin/activate \
     && python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install -r requirements_qwen.txt
+    && python -m pip install -r requirements_qwen.txt \
+    && MAX_JOBS=4 python -m pip install -U flash-attn --no-build-isolation
 
 RUN chmod +x start_worker.sh
 

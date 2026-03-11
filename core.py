@@ -52,7 +52,7 @@ CHAPTER_MANIFEST_FILENAME = "chapter_exports.json"
 TTS_ENGINE = os.getenv("CHATTERBLEZ_TTS_ENGINE", "qwen3_5").strip().lower()
 _TTS_RESOURCE_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 QWEN_MODEL_ID = os.getenv("CHATTERBLEZ_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").strip()
-QWEN_SPEAKER_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_SPEAKER", "Serena").strip() or "Serena"
+QWEN_SPEAKER_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_SPEAKER", "aiden").strip() or "aiden"
 QWEN_INSTRUCT_DEFAULT = os.getenv("CHATTERBLEZ_QWEN_INSTRUCT", "").strip()
 QWEN_ATTN_IMPL = os.getenv("CHATTERBLEZ_QWEN_ATTN_IMPL", "flash_attention_2").strip()
 QWEN_DTYPE = os.getenv("CHATTERBLEZ_QWEN_DTYPE", "auto").strip().lower()
@@ -334,13 +334,18 @@ def synthesize_with_qwen(
         supported_speakers = model.get_supported_speakers()
     except Exception:
         supported_speakers = []
-    if supported_speakers and selected_speaker not in set(supported_speakers):
-        logging.warning(
-            "Speaker '%s' non supportato dal modello. Uso '%s'.",
-            selected_speaker,
-            supported_speakers[0],
-        )
-        selected_speaker = supported_speakers[0]
+    if supported_speakers:
+        supported_map = {str(item).lower(): str(item) for item in supported_speakers}
+        resolved = supported_map.get(selected_speaker.lower())
+        if resolved:
+            selected_speaker = resolved
+        elif selected_speaker not in set(supported_speakers):
+            logging.warning(
+                "Speaker '%s' non supportato dal modello. Uso '%s'.",
+                selected_speaker,
+                supported_speakers[0],
+            )
+            selected_speaker = supported_speakers[0]
     generation_kwargs: Dict[str, Any] = {}
     if temperature is not None:
         generation_kwargs["temperature"] = float(temperature)
@@ -902,6 +907,22 @@ def split_sentence_by_length(text: str, max_chars: int) -> List[str]:
         parts.append(' '.join(current))
 
     return parts
+
+
+def plan_batches_for_text(nlp, text: str, max_sentences: int | None = None) -> List[str]:
+    """Build the exact batch plan used for TTS so global chunk progress can be deterministic."""
+    doc = nlp(text)
+    sentences = list(doc.sents)
+    batches = batch_sentences_intelligently(
+        sentences,
+        min_chars=BATCH_MIN_CHARS,
+        max_chars=BATCH_MAX_CHARS,
+    )
+    if max_sentences and int(max_sentences) > 0:
+        batches = batches[: int(max_sentences)]
+    return batches
+
+
 def main(file_path, pick_manually, speed, book_year='', output_folder='.',
          max_chapters=None, max_sentences=None, selected_chapters=None, selected_chapter_indices=None, post_event=None, audio_prompt_wav=None, batch_files=None, ignore_list=None, should_stop=None,
          repetition_penalty=1.1, min_p=0.02, top_p=0.95, top_k=None, exaggeration=0.4, cfg_weight=0.8, temperature=0.85,
@@ -1119,11 +1140,11 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         logging.warning("Audio prompt non supportato con il motore %s; verrà ignorato.", engine_name)
 
     nlp = get_nlp()
-    for i, chapter in enumerate(selected_chapters, start=1):
-        if should_stop():
-            logging.info("Synthesis interrupted by user (chapter loop).")
-            break
-        if max_chapters and i > max_chapters: break
+    total_selected_chapters = len(selected_chapters)
+    prepared_chapter_texts: Dict[int, str] = {}
+    planned_chunk_totals: Dict[int, int] = {}
+    global_chunk_total = 0
+    for idx, chapter in enumerate(selected_chapters, start=1):
         lines = chapter.extracted_text.splitlines()
         cleaned_lines = []
         for line in lines:
@@ -1131,8 +1152,38 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
             if cleaned_line.strip() and re.search(r"\w", cleaned_line):
                 cleaned_lines.append(cleaned_line)
         cleaned_lines = merge_hyphenated_lines(cleaned_lines)
-        # Collapse PDF line wraps so mid-sentence newlines don't hit the TTS.
         text = " ".join(cleaned_lines)
+        prepared_chapter_texts[idx] = text
+        if len(text.strip()) < 10:
+            planned_batches = []
+        else:
+            planned_batches = plan_batches_for_text(nlp, text, max_sentences=max_sentences)
+        chapter_total_chunks = len(planned_batches)
+        planned_chunk_totals[idx] = chapter_total_chunks
+        global_chunk_total += chapter_total_chunks
+        logging.info(
+            "CHAPTER_CHUNK_PLAN chapter=%s total=%s",
+            idx,
+            chapter_total_chunks,
+        )
+    logging.info(
+        "GLOBAL_CHUNK_PLAN total=%s chapters=%s",
+        global_chunk_total,
+        total_selected_chapters,
+    )
+
+    for i, chapter in enumerate(selected_chapters, start=1):
+        if should_stop():
+            logging.info("Synthesis interrupted by user (chapter loop).")
+            break
+        if max_chapters and i > max_chapters: break
+        logging.info(
+            "CHAPTER_PROGRESS current=%s total=%s remaining=%s",
+            i,
+            total_selected_chapters,
+            max(0, total_selected_chapters - i),
+        )
+        text = prepared_chapter_texts.get(i, "")
 
         # Sanitize the chapter name to remove all non-alphanumeric characters for the filename
         xhtml_file_name = re.sub(r'[^a-zA-Z0-9-]', '', chapter.get_name()).replace('xhtml', '').replace('html', '')
@@ -1143,6 +1194,13 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
         if Path(chapter_wav_path).exists():
             logging.info(f'File for chapter {i} already exists. Skipping')
             stats.processed_chars += len(text)
+            planned_for_chapter = planned_chunk_totals.get(i, 0)
+            if planned_for_chapter > 0:
+                logging.info(
+                    "CHUNK_PROGRESS current=%s total=%s remaining=0",
+                    planned_for_chapter,
+                    planned_for_chapter,
+                )
             if post_event and hasattr(chapter, "chapter_index"):
                 post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
             continue
@@ -1461,6 +1519,8 @@ def gen_audio_segments(
         min_chars=batch_min_chars,
         max_chars=batch_max_chars
     )
+    if max_sentences and int(max_sentences) > 0:
+        batches = batches[: int(max_sentences)]
 
     total_batches = len(batches)
     logging.info(f"Split {len(sentences)} sentences into {total_batches} batches")
@@ -1475,8 +1535,6 @@ def gen_audio_segments(
         if should_stop():
             logging.info("Synthesis interrupted by user (batch loop).")
             return
-        if max_sentences and i >= max_sentences:
-            break
 
         batch_text = batch_text.strip()
         if not batch_text:

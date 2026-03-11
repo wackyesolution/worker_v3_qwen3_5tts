@@ -70,6 +70,10 @@ MAX_LOG_LINES = 10000
 SUPPORTED_EXTS = {".pdf", ".epub", ".txt"}
 RUN_ID_PATTERN = re.compile(r"\d{8}_\d{6}(?:_preview)?$")
 CHUNK_PROGRESS_RE = re.compile(r"CHUNK_PROGRESS current=(\d+) total=(\d+) remaining=(\d+)")
+CHAPTER_PROGRESS_RE = re.compile(r"CHAPTER_PROGRESS current=(\d+) total=(\d+) remaining=(\d+)")
+CHAPTER_CHUNK_PLAN_RE = re.compile(r"CHAPTER_CHUNK_PLAN chapter=(\d+) total=(\d+)")
+GLOBAL_CHUNK_PLAN_RE = re.compile(r"GLOBAL_CHUNK_PLAN total=(\d+) chapters=(\d+)")
+SPLIT_BATCH_RE = re.compile(r"Split\s+\d+\s+sentences\s+into\s+(\d+)\s+batches", re.IGNORECASE)
 ARTIFACT_KINDS = {
     ".m4a": "wav",
     ".wav": "wav",
@@ -108,6 +112,9 @@ CURRENT_JOB: Optional[Dict[str, Any]] = None
 CURRENT_JOB_PROCESS: Optional[subprocess.Popen] = None
 
 TRIAL_SYNTH_TIMEOUT_SECONDS = int(os.getenv("TRIAL_SYNTH_TIMEOUT_SECONDS", "180"))
+LIVE_LOG_LINE_MAX_CHARS = int(os.getenv("WORKER_LIVE_LOG_LINE_MAX_CHARS", "1200"))
+LIVE_LOG_BATCH_MAX_LINES = int(os.getenv("WORKER_LIVE_LOG_BATCH_MAX_LINES", "120"))
+LIVE_LOG_READ_CHUNK_BYTES = int(os.getenv("WORKER_LIVE_LOG_READ_CHUNK_BYTES", str(256 * 1024)))
 
 
 class ProcessOptions(BaseModel):
@@ -152,6 +159,7 @@ class HeartbeatState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._state: Dict[str, Any] = {}
+        self._log_lines: List[str] = []
 
     def update(self, **kwargs: Any) -> None:
         with self._lock:
@@ -159,9 +167,213 @@ class HeartbeatState:
                 if value is not None:
                     self._state[key] = value
 
-    def snapshot(self) -> Dict[str, Any]:
+    def append_log_lines(self, lines: List[str]) -> None:
+        if not lines:
+            return
+        cleaned: List[str] = []
+        for line in lines:
+            text = str(line or "").rstrip("\r")
+            if not text:
+                continue
+            if len(text) > LIVE_LOG_LINE_MAX_CHARS:
+                text = text[: LIVE_LOG_LINE_MAX_CHARS - 1] + "…"
+            cleaned.append(text)
+        if not cleaned:
+            return
         with self._lock:
-            return dict(self._state)
+            self._log_lines.extend(cleaned)
+            overflow = len(self._log_lines) - (LIVE_LOG_BATCH_MAX_LINES * 4)
+            if overflow > 0:
+                self._log_lines = self._log_lines[overflow:]
+
+    def snapshot(
+        self,
+        *,
+        drain_log_lines: bool = False,
+        max_log_lines: int = LIVE_LOG_BATCH_MAX_LINES,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            payload = dict(self._state)
+            if max_log_lines < 0:
+                max_log_lines = 0
+            if self._log_lines:
+                chunk = self._log_lines[:max_log_lines] if max_log_lines else []
+                if drain_log_lines and chunk:
+                    self._log_lines = self._log_lines[len(chunk):]
+                if chunk:
+                    payload["log_lines"] = chunk
+            return payload
+
+
+class ProgressTelemetryTracker:
+    """Parse CLI log lines and expose normalized progress telemetry."""
+
+    def __init__(self) -> None:
+        self.started_monotonic = time.monotonic()
+        self.chapter_current: Optional[int] = None
+        self.chapter_total: Optional[int] = None
+        self.chapter_chunk_totals: Dict[int, int] = {}
+        self.global_chunk_total: Optional[int] = None
+        # Local chunk info for the current chapter.
+        self.chunk_current: Optional[int] = None
+        self.chunk_total: Optional[int] = None
+        self.chunks_remaining: Optional[int] = None
+
+    def _sum_known_chunk_totals(self) -> int:
+        return int(sum(max(0, int(total or 0)) for total in self.chapter_chunk_totals.values()))
+
+    def _chunks_completed_before_current_chapter(self) -> int:
+        if self.chapter_current is None:
+            return 0
+        current = int(self.chapter_current)
+        completed = 0
+        for chapter_index, total in self.chapter_chunk_totals.items():
+            if int(chapter_index) < current:
+                completed += max(0, int(total or 0))
+        return int(completed)
+
+    def _resolved_global_chunk_total(self) -> Optional[int]:
+        if self.global_chunk_total is not None and int(self.global_chunk_total) > 0:
+            return int(self.global_chunk_total)
+        known_total = self._sum_known_chunk_totals()
+        if known_total > 0:
+            return int(known_total)
+        if self.chunk_total is not None and int(self.chunk_total) > 0:
+            return int(self.chunk_total)
+        return None
+
+    def update_from_line(self, line: str) -> Optional[Dict[str, Any]]:
+        text = str(line or "")
+        changed = False
+
+        global_chunk_match = GLOBAL_CHUNK_PLAN_RE.search(text)
+        if global_chunk_match:
+            global_chunk_total = max(0, int(global_chunk_match.group(1)))
+            if self.global_chunk_total != global_chunk_total:
+                changed = True
+            self.global_chunk_total = global_chunk_total
+
+        chapter_chunk_plan_match = CHAPTER_CHUNK_PLAN_RE.search(text)
+        if chapter_chunk_plan_match:
+            chapter_index = max(1, int(chapter_chunk_plan_match.group(1)))
+            chapter_chunk_total = max(0, int(chapter_chunk_plan_match.group(2)))
+            if self.chapter_chunk_totals.get(chapter_index) != chapter_chunk_total:
+                changed = True
+            self.chapter_chunk_totals[chapter_index] = chapter_chunk_total
+
+        chapter_match = CHAPTER_PROGRESS_RE.search(text)
+        if chapter_match:
+            chapter_current = int(chapter_match.group(1))
+            chapter_total = max(1, int(chapter_match.group(2)))
+            if self.chapter_current != chapter_current or self.chapter_total != chapter_total:
+                changed = True
+            self.chapter_current = chapter_current
+            self.chapter_total = chapter_total
+            # New chapter starts from zero progress until first CHUNK_PROGRESS.
+            if self.chunk_current != 0:
+                changed = True
+            self.chunk_current = 0
+            planned_for_chapter = self.chapter_chunk_totals.get(chapter_current)
+            if planned_for_chapter is not None:
+                if self.chunk_total != planned_for_chapter:
+                    changed = True
+                self.chunk_total = int(planned_for_chapter)
+                chapter_remaining = max(0, int(planned_for_chapter))
+                if self.chunks_remaining != chapter_remaining:
+                    changed = True
+                self.chunks_remaining = chapter_remaining
+            else:
+                if self.chunks_remaining is not None:
+                    changed = True
+                self.chunks_remaining = None
+
+        split_match = SPLIT_BATCH_RE.search(text)
+        if split_match:
+            chunk_total = max(1, int(split_match.group(1)))
+            if self.chapter_current is not None:
+                chapter_idx = int(self.chapter_current)
+                if self.chapter_chunk_totals.get(chapter_idx) != chunk_total:
+                    changed = True
+                self.chapter_chunk_totals[chapter_idx] = chunk_total
+            if self.chunk_total != chunk_total:
+                changed = True
+            self.chunk_total = chunk_total
+            if self.chunk_current is None:
+                self.chunk_current = 0
+            self.chunks_remaining = max(0, chunk_total - int(self.chunk_current or 0))
+
+        chunk_match = CHUNK_PROGRESS_RE.search(text)
+        if chunk_match:
+            chunk_current = int(chunk_match.group(1))
+            chunk_total = max(1, int(chunk_match.group(2)))
+            chunks_remaining = max(0, int(chunk_match.group(3)))
+            if (
+                self.chunk_current != chunk_current
+                or self.chunk_total != chunk_total
+                or self.chunks_remaining != chunks_remaining
+            ):
+                changed = True
+            self.chunk_current = chunk_current
+            self.chunk_total = chunk_total
+            self.chunks_remaining = chunks_remaining
+
+        if not changed:
+            return None
+        return self.snapshot()
+
+    def snapshot(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if self.chapter_current is not None:
+            payload["chapter_current"] = int(self.chapter_current)
+        if self.chapter_total is not None:
+            payload["chapter_total"] = int(self.chapter_total)
+
+        global_chunk_current: Optional[int] = None
+        if self.chapter_current is not None:
+            global_chunk_current = self._chunks_completed_before_current_chapter()
+            if self.chunk_current is not None:
+                global_chunk_current += max(0, int(self.chunk_current))
+        elif self.chunk_current is not None:
+            global_chunk_current = max(0, int(self.chunk_current))
+        global_chunk_total = self._resolved_global_chunk_total()
+
+        if global_chunk_current is not None:
+            payload["chunk_current"] = int(global_chunk_current)
+        if global_chunk_total is not None:
+            payload["chunk_total"] = int(global_chunk_total)
+        if global_chunk_current is not None and global_chunk_total is not None:
+            payload["chunks_remaining"] = max(0, int(global_chunk_total - global_chunk_current))
+        elif self.chunks_remaining is not None:
+            payload["chunks_remaining"] = int(self.chunks_remaining)
+
+        progress_percent: Optional[float] = None
+        if global_chunk_current is not None and global_chunk_total and global_chunk_total > 0:
+            progress_percent = (float(global_chunk_current) / float(global_chunk_total)) * 100.0
+        elif self.chapter_current is not None and self.chapter_total:
+            progress_percent = (float(self.chapter_current - 1) / float(self.chapter_total)) * 100.0
+
+        if progress_percent is not None:
+            bounded = max(0.0, min(100.0, progress_percent))
+            payload["progress"] = bounded
+            payload["progress_percent"] = bounded
+            elapsed = max(0.0, time.monotonic() - self.started_monotonic)
+            if bounded >= 100.0:
+                payload["eta_seconds"] = 0
+            elif bounded > 0:
+                remaining_seconds = elapsed * ((100.0 - bounded) / bounded)
+                payload["eta_seconds"] = int(max(0, round(remaining_seconds)))
+
+        if self.chapter_current is not None and self.chapter_total:
+            if global_chunk_current is not None and global_chunk_total:
+                payload["message"] = (
+                    f"chapter {self.chapter_current}/{self.chapter_total} · "
+                    f"chunk {global_chunk_current}/{global_chunk_total}"
+                )
+            else:
+                payload["message"] = f"chapter {self.chapter_current}/{self.chapter_total}"
+        elif global_chunk_current is not None and global_chunk_total:
+            payload["message"] = f"chunk {global_chunk_current}/{global_chunk_total}"
+        return payload
 
 
 # Central HTTP client for internal endpoints (job info, heartbeat, artifacts).
@@ -202,21 +414,36 @@ class CentralClient:
         job_id: int,
         message: Optional[str] = None,
         progress: Optional[float] = None,
+        progress_percent: Optional[float] = None,
         chunk_current: Optional[int] = None,
         chunk_total: Optional[int] = None,
         chunks_remaining: Optional[int] = None,
+        chapter_current: Optional[int] = None,
+        chapter_total: Optional[int] = None,
+        eta_seconds: Optional[int] = None,
+        log_lines: Optional[List[str]] = None,
     ) -> None:
         payload: Dict[str, Any] = {}
         if message:
             payload["message"] = message
         if progress is not None:
             payload["progress"] = float(progress)
+        if progress_percent is not None:
+            payload["progress_percent"] = float(progress_percent)
         if chunk_current is not None:
             payload["chunk_current"] = int(chunk_current)
         if chunk_total is not None:
             payload["chunk_total"] = int(chunk_total)
         if chunks_remaining is not None:
             payload["chunks_remaining"] = int(chunks_remaining)
+        if chapter_current is not None:
+            payload["chapter_current"] = int(chapter_current)
+        if chapter_total is not None:
+            payload["chapter_total"] = int(chapter_total)
+        if eta_seconds is not None:
+            payload["eta_seconds"] = int(eta_seconds)
+        if log_lines:
+            payload["log_lines"] = [str(line) for line in log_lines if str(line or "").strip()]
         self.request("POST", f"/internal/jobs/{job_id}/heartbeat", json=payload)
 
     def complete(
@@ -714,23 +941,36 @@ def tail_lines(path: Path, limit: int = 30) -> List[str]:
     return lines[-limit:]
 
 
-def extract_chunk_progress_from_log(path: Path) -> Optional[Dict[str, Any]]:
-    for line in reversed(tail_lines(path, 120)):
-        match = CHUNK_PROGRESS_RE.search(line or "")
-        if not match:
-            continue
-        chunk_current = int(match.group(1))
-        chunk_total = max(1, int(match.group(2)))
-        chunks_remaining = max(0, int(match.group(3)))
-        progress = max(0.0, min(100.0, (chunk_current / float(chunk_total)) * 100.0))
-        return {
-            "chunk_current": chunk_current,
-            "chunk_total": chunk_total,
-            "chunks_remaining": chunks_remaining,
-            "progress": progress,
-            "message": f"chunk {chunk_current}/{chunk_total}",
-        }
-    return None
+def read_new_log_lines(path: Path, cursor: Dict[str, Any]) -> List[str]:
+    """
+    Read appended log lines from `path`, keeping cursor state in-memory.
+    Returns only newly appended complete lines.
+    """
+    if not path.exists():
+        return []
+    offset = int(cursor.get("offset") or 0)
+    remainder = str(cursor.get("remainder") or "")
+    file_size = path.stat().st_size
+    if offset < 0 or offset > file_size:
+        offset = 0
+        remainder = ""
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        data = handle.read(max(1024, LIVE_LOG_READ_CHUNK_BYTES))
+    if not data:
+        cursor["offset"] = offset
+        cursor["remainder"] = remainder
+        return []
+    new_offset = offset + len(data)
+    text = remainder + data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if text and not text.endswith("\n"):
+        remainder = lines.pop() if lines else text
+    else:
+        remainder = ""
+    cursor["offset"] = new_offset
+    cursor["remainder"] = remainder
+    return lines
 
 
 def trim_log_file(path: Path, retain_lines: int = MAX_LOG_LINES) -> None:
@@ -914,6 +1154,7 @@ def run_pipeline(
     preview_mode: bool = False,
     max_preview_words: Optional[int] = None,
     on_chunk_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_log_lines: Optional[Callable[[List[str]], None]] = None,
 ) -> Dict:
     global CURRENT_JOB, CURRENT_JOB_PROCESS
     # This calls PRE_SERVER which handles ffmpeg/whisper/azzurra/csm end-to-end.
@@ -1030,9 +1271,11 @@ def run_pipeline(
             "log_path": str(log_path),
         }
         retcode = -1
-        last_progress_signature: Optional[Tuple[int, int, int]] = None
+        last_progress_signature: Optional[Tuple[int, int, int, int, int]] = None
+        telemetry_tracker = ProgressTelemetryTracker()
+        log_cursor: Dict[str, Any] = {"offset": 0, "remainder": ""}
         try:
-            with log_path.open("w", encoding="utf-8") as log_handle:
+            with log_path.open("w", encoding="utf-8", buffering=1) as log_handle:
                 process = subprocess.Popen(
                     cmd,
                     stdout=log_handle,
@@ -1043,21 +1286,36 @@ def run_pipeline(
                 CURRENT_JOB_PROCESS = process
                 while True:
                     polled = process.poll()
-                    progress_payload = extract_chunk_progress_from_log(log_path)
-                    if progress_payload:
+                    new_lines = read_new_log_lines(log_path, log_cursor)
+                    if new_lines and on_log_lines:
+                        on_log_lines(new_lines)
+                    for line in new_lines:
+                        progress_payload = telemetry_tracker.update_from_line(line)
+                        if not progress_payload:
+                            continue
                         signature = (
+                            int(progress_payload.get("chapter_current") or 0),
+                            int(progress_payload.get("chapter_total") or 0),
                             int(progress_payload.get("chunk_current") or 0),
                             int(progress_payload.get("chunk_total") or 0),
-                            int(progress_payload.get("chunks_remaining") or 0),
+                            int(round(float(progress_payload.get("progress_percent") or 0.0) * 100)),
                         )
-                        if signature != last_progress_signature:
-                            last_progress_signature = signature
-                            if on_chunk_progress:
-                                on_chunk_progress(progress_payload)
+                        if signature == last_progress_signature:
+                            continue
+                        last_progress_signature = signature
+                        if on_chunk_progress:
+                            on_chunk_progress(progress_payload)
                     if polled is not None:
                         retcode = int(polled)
                         break
-                    time.sleep(1.0)
+                    time.sleep(0.7)
+                trailing_lines = read_new_log_lines(log_path, log_cursor)
+                if trailing_lines and on_log_lines:
+                    on_log_lines(trailing_lines)
+                for line in trailing_lines:
+                    progress_payload = telemetry_tracker.update_from_line(line)
+                    if progress_payload and on_chunk_progress:
+                        on_chunk_progress(progress_payload)
         finally:
             CURRENT_JOB = None
             CURRENT_JOB_PROCESS = None
@@ -1194,14 +1452,19 @@ def heartbeat_loop(
     pulse_seconds = max(1, min(max(1, interval_seconds), 20))
     while not stop_event.wait(timeout=pulse_seconds):
         try:
-            snapshot = state.snapshot()
+            snapshot = state.snapshot(drain_log_lines=True)
             client.heartbeat(
                 job_id,
                 message=snapshot.get("message"),
                 progress=snapshot.get("progress"),
+                progress_percent=snapshot.get("progress_percent"),
                 chunk_current=snapshot.get("chunk_current"),
                 chunk_total=snapshot.get("chunk_total"),
                 chunks_remaining=snapshot.get("chunks_remaining"),
+                chapter_current=snapshot.get("chapter_current"),
+                chapter_total=snapshot.get("chapter_total"),
+                eta_seconds=snapshot.get("eta_seconds"),
+                log_lines=snapshot.get("log_lines"),
             )
         except Exception as exc:  # pragma: no cover - best effort
             logging.warning("Heartbeat failed for job %s: %s", job_id, exc)
@@ -1267,19 +1530,27 @@ def run_worker_job(
         now = time.monotonic()
         if now - last_progress_push_at < 5.0:
             return
-        snapshot = heartbeat_state.snapshot()
+        snapshot = heartbeat_state.snapshot(drain_log_lines=True)
         try:
             client.heartbeat(
                 job_id,
                 message=snapshot.get("message"),
                 progress=snapshot.get("progress"),
+                progress_percent=snapshot.get("progress_percent"),
                 chunk_current=snapshot.get("chunk_current"),
                 chunk_total=snapshot.get("chunk_total"),
                 chunks_remaining=snapshot.get("chunks_remaining"),
+                chapter_current=snapshot.get("chapter_current"),
+                chapter_total=snapshot.get("chapter_total"),
+                eta_seconds=snapshot.get("eta_seconds"),
+                log_lines=snapshot.get("log_lines"),
             )
             last_progress_push_at = now
         except Exception as exc:  # pragma: no cover - best effort
             logging.warning("Chunk progress heartbeat failed for job %s: %s", job_id, exc)
+
+    def on_log_lines(lines: List[str]) -> None:
+        heartbeat_state.append_log_lines(lines)
 
     try:
         result = run_pipeline(
@@ -1289,6 +1560,7 @@ def run_worker_job(
             preview_mode=preview_mode,
             max_preview_words=max_preview_words or 2200,
             on_chunk_progress=on_chunk_progress,
+            on_log_lines=on_log_lines,
             **pipeline_kwargs,
         )
         artifacts = result.get("artifacts") if isinstance(result, dict) else None
@@ -1304,6 +1576,24 @@ def run_worker_job(
         logging.exception("Worker job %s raised an unhandled exception", job_id)
         error_message = str(exc)
     finally:
+        final_snapshot = heartbeat_state.snapshot(drain_log_lines=True)
+        if final_snapshot.get("log_lines"):
+            try:
+                client.heartbeat(
+                    job_id,
+                    message=final_snapshot.get("message"),
+                    progress=final_snapshot.get("progress"),
+                    progress_percent=final_snapshot.get("progress_percent"),
+                    chunk_current=final_snapshot.get("chunk_current"),
+                    chunk_total=final_snapshot.get("chunk_total"),
+                    chunks_remaining=final_snapshot.get("chunks_remaining"),
+                    chapter_current=final_snapshot.get("chapter_current"),
+                    chapter_total=final_snapshot.get("chapter_total"),
+                    eta_seconds=final_snapshot.get("eta_seconds"),
+                    log_lines=final_snapshot.get("log_lines"),
+                )
+            except Exception as exc:  # pragma: no cover - best effort
+                logging.warning("Final log heartbeat failed for job %s: %s", job_id, exc)
         stop_event.set()
         heartbeat_thread.join(timeout=5)
         log_path = LOGS_DIR / f"book_{book_id}_{run_id}.log"
