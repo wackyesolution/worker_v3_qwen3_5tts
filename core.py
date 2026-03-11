@@ -61,8 +61,10 @@ _QWEN_CACHE: Dict[str, Any] = {"model": None}
 # Default chunk sizes for TTS batching.
 # Keep chunks reasonably small to avoid early EOS/truncation, but with the
 # lighter Qwen model we can afford a slightly larger max to reduce fragmentation.
-BATCH_MIN_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "120"))
-BATCH_MAX_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "420"))
+BATCH_MIN_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "240"))
+BATCH_MAX_CHARS = int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "560"))
+# Number of text batches sent in one Qwen generate call.
+QWEN_MICROBATCH_SIZE = max(1, int(os.getenv("CHATTERBLEZ_QWEN_MICROBATCH_SIZE", "2")))
 
 
 def remove_silence_from_audio(input_file, output_file, silence_thresh=-50, min_silence_len=1000, keep_silence=200):
@@ -360,19 +362,8 @@ def load_tts_resources(use_multilingual: bool, cache: bool = False) -> Dict[str,
     return resources
 
 
-def synthesize_with_qwen(
-    tts_resources: Dict[str, Any],
-    text: str,
-    *,
-    language_id: str | None = None,
-    temperature: float | None = None,
-    top_p: float | None = None,
-    repetition_penalty: float | None = None,
-    top_k: int | None = None,
-    speaker: str | None = None,
-) -> np.ndarray:
-    model = tts_resources["model"]
-    selected_speaker = (speaker or tts_resources.get("speaker") or QWEN_SPEAKER_DEFAULT).strip()
+def _resolve_qwen_speaker(model: Any, requested_speaker: str | None) -> str:
+    selected_speaker = (requested_speaker or QWEN_SPEAKER_DEFAULT).strip() or QWEN_SPEAKER_DEFAULT
     try:
         supported_speakers = model.get_supported_speakers()
     except Exception:
@@ -389,6 +380,16 @@ def synthesize_with_qwen(
                 supported_speakers[0],
             )
             selected_speaker = supported_speakers[0]
+    return selected_speaker
+
+
+def _build_qwen_generation_kwargs(
+    *,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    repetition_penalty: float | None = None,
+    top_k: int | None = None,
+) -> Dict[str, Any]:
     generation_kwargs: Dict[str, Any] = {}
     if temperature is not None:
         generation_kwargs["temperature"] = float(temperature)
@@ -398,11 +399,54 @@ def synthesize_with_qwen(
         generation_kwargs["repetition_penalty"] = float(repetition_penalty)
     if top_k is not None:
         generation_kwargs["top_k"] = int(top_k)
+    return generation_kwargs
+
+
+def _normalize_qwen_wavs(wavs: List[Any], sr: int) -> List[np.ndarray]:
+    if not wavs:
+        raise RuntimeError("Qwen3-TTS non ha prodotto alcun output audio.")
+    out: List[np.ndarray] = []
+    for wav in wavs:
+        arr = np.asarray(wav, dtype=np.float32).flatten()
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        arr = np.clip(arr, -1.0, 1.0)
+        if int(sr) != sample_rate:
+            logging.warning("Sample rate inatteso da Qwen3-TTS (%s). Resample a %s.", sr, sample_rate)
+            arr = resample_audio_linear(arr, int(sr), sample_rate)
+        out.append(arr)
+    return out
+
+
+def synthesize_many_with_qwen(
+    tts_resources: Dict[str, Any],
+    texts: List[str],
+    *,
+    language_id: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    repetition_penalty: float | None = None,
+    top_k: int | None = None,
+    speaker: str | None = None,
+) -> List[np.ndarray]:
+    model = tts_resources["model"]
+    cleaned_texts = [str(item or "").strip() for item in texts if str(item or "").strip()]
+    if not cleaned_texts:
+        return []
+    selected_speaker = _resolve_qwen_speaker(
+        model,
+        speaker or tts_resources.get("speaker") or QWEN_SPEAKER_DEFAULT,
+    )
+    generation_kwargs = _build_qwen_generation_kwargs(
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        top_k=top_k,
+    )
     language = map_language_id_to_qwen(language_id)
     instruct = tts_resources.get("instruct")
     try:
         wavs, sr = model.generate_custom_voice(
-            text=text,
+            text=cleaned_texts,
             language=language,
             speaker=selected_speaker,
             instruct=instruct,
@@ -415,22 +459,44 @@ def synthesize_with_qwen(
                 generation_kwargs,
             )
             wavs, sr = model.generate_custom_voice(
-                text=text,
+                text=cleaned_texts,
                 language=language,
                 speaker=selected_speaker,
                 instruct=instruct,
             )
         else:
             raise
-    if not wavs:
+    if len(wavs or []) != len(cleaned_texts):
+        raise RuntimeError(
+            f"Qwen3-TTS output batch size mismatch: input={len(cleaned_texts)} output={len(wavs or [])}."
+        )
+    return _normalize_qwen_wavs(wavs, int(sr))
+
+
+def synthesize_with_qwen(
+    tts_resources: Dict[str, Any],
+    text: str,
+    *,
+    language_id: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    repetition_penalty: float | None = None,
+    top_k: int | None = None,
+    speaker: str | None = None,
+) -> np.ndarray:
+    generated = synthesize_many_with_qwen(
+        tts_resources,
+        [text],
+        language_id=language_id,
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        top_k=top_k,
+        speaker=speaker,
+    )
+    if not generated:
         raise RuntimeError("Qwen3-TTS non ha prodotto alcun output audio.")
-    wav = np.asarray(wavs[0], dtype=np.float32).flatten()
-    wav = np.nan_to_num(wav, nan=0.0, posinf=0.0, neginf=0.0)
-    wav = np.clip(wav, -1.0, 1.0)
-    if int(sr) != sample_rate:
-        logging.warning("Sample rate inatteso da Qwen3-TTS (%s). Resample a %s.", sr, sample_rate)
-        wav = resample_audio_linear(wav, int(sr), sample_rate)
-    return wav
+    return generated[0]
 
 
 import string
@@ -1253,7 +1319,16 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
                 chapter_wav_files.remove(chapter_wav_path)
             continue
 
-        logging.info(f'Writing  {text}')
+        preview = re.sub(r"\s+", " ", text).strip()
+        if len(preview) > 140:
+            preview = preview[:140] + "..."
+        logging.info(
+            "CHAPTER_TEXT chapter=%s chars=%s words=%s preview=%s",
+            i,
+            len(text),
+            len(text.split()),
+            preview,
+        )
         start_time = time.time()
         if post_event and hasattr(chapter, "chapter_index"):
             post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
@@ -1567,9 +1642,10 @@ def gen_audio_segments(
 
     total_batches = len(batches)
     logging.info(
-        "BATCH_CONFIG min_chars=%s max_chars=%s sentence_gap_ms=%s question_gap_ms=%s force_sentence_gaps=%s",
+        "BATCH_CONFIG min_chars=%s max_chars=%s microbatch_size=%s sentence_gap_ms=%s question_gap_ms=%s force_sentence_gaps=%s",
         batch_min_chars,
         batch_max_chars,
+        QWEN_MICROBATCH_SIZE,
         sentence_gap_ms,
         question_gap_ms,
         force_sentence_gaps,
@@ -1582,69 +1658,121 @@ def gen_audio_segments(
     if total_batches > 3:
         logging.info(f"  ... and {total_batches - 3} more batches")
 
-    for i, batch_text in enumerate(batches):
+    if engine != "qwen":
+        raise RuntimeError(f"Engine non supportato su worker_v3_qwen3_5tts: {engine}")
+
+    chunk_index = 0
+    microbatch_size = max(1, int(QWEN_MICROBATCH_SIZE))
+    while chunk_index < total_batches:
         if should_stop():
             logging.info("Synthesis interrupted by user (batch loop).")
             return
 
-        batch_text = batch_text.strip()
-        if not batch_text:
+        group: List[Tuple[int, str]] = []
+        while chunk_index < total_batches and len(group) < microbatch_size:
+            batch_text = batches[chunk_index].strip()
+            if batch_text:
+                group.append((chunk_index, batch_text))
+            chunk_index += 1
+        if not group:
             continue
 
-
-        if engine != "qwen":
-            raise RuntimeError(f"Engine non supportato su worker_v3_qwen3_5tts: {engine}")
-        current_batch = i + 1
-        synth_start = time.perf_counter()
-        wav_array = synthesize_with_qwen(
-            tts_resources,
-            batch_text,
-            language_id=language_id,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            top_k=top_k,
+        texts = [item[1] for item in group]
+        group_chars = sum(len(item) for item in texts)
+        group_start = time.perf_counter()
+        try:
+            wav_arrays = synthesize_many_with_qwen(
+                tts_resources,
+                texts,
+                language_id=language_id,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                top_k=top_k,
+            )
+        except Exception as exc:
+            logging.warning(
+                "QWEN_MICROBATCH fallback to single-call mode (size=%s): %s",
+                len(texts),
+                exc,
+            )
+            wav_arrays = [
+                synthesize_with_qwen(
+                    tts_resources,
+                    text,
+                    language_id=language_id,
+                    temperature=temperature,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    top_k=top_k,
+                )
+                for text in texts
+            ]
+        group_synth_seconds = max(0.0, time.perf_counter() - group_start)
+        group_audio_seconds = sum(
+            float(np.asarray(wav).size) / float(sample_rate) for wav in wav_arrays
         )
-        synth_seconds = max(0.0, time.perf_counter() - synth_start)
-        chunk_chars = len(batch_text)
-        audio_seconds = float(np.asarray(wav_array).size) / float(sample_rate) if wav_array is not None else 0.0
-        chars_per_second = (chunk_chars / synth_seconds) if synth_seconds > 0 else 0.0
-        realtime_factor = (audio_seconds / synth_seconds) if synth_seconds > 0 else 0.0
-        logging.info(
-            "CHUNK_METRICS current=%s total=%s chars=%s synth_s=%.2f audio_s=%.2f char_per_s=%.2f rtf=%.2f",
-            current_batch,
-            total_batches,
-            chunk_chars,
-            synth_seconds,
-            audio_seconds,
-            chars_per_second,
-            realtime_factor,
-        )
-        yield wav_array
-        remaining_batches = max(0, total_batches - current_batch)
-        logging.info(
-            "CHUNK_PROGRESS current=%s total=%s remaining=%s",
-            current_batch,
-            total_batches,
-            remaining_batches,
-        )
+        group_chars_per_second = (group_chars / group_synth_seconds) if group_synth_seconds > 0 else 0.0
+        group_rtf = (group_audio_seconds / group_synth_seconds) if group_synth_seconds > 0 else 0.0
+        if len(group) > 1:
+            logging.info(
+                "MICROBATCH_METRICS start=%s size=%s chars=%s synth_s=%.2f audio_s=%.2f char_per_s=%.2f rtf=%.2f",
+                group[0][0] + 1,
+                len(group),
+                group_chars,
+                group_synth_seconds,
+                group_audio_seconds,
+                group_chars_per_second,
+                group_rtf,
+            )
 
-        gap_duration = 0
-        if force_sentence_gaps:
-            gap_duration = sentence_gap_ms
-        if question_gap_ms > 0 and batch_text.rstrip().endswith("?"):
-            gap_duration = max(gap_duration, question_gap_ms)
+        for local_idx, (original_idx, batch_text) in enumerate(group):
+            wav_array = wav_arrays[local_idx]
+            current_batch = original_idx + 1
+            chunk_chars = len(batch_text)
+            audio_seconds = float(np.asarray(wav_array).size) / float(sample_rate) if wav_array is not None else 0.0
+            if group_audio_seconds > 0:
+                synth_seconds = group_synth_seconds * (audio_seconds / group_audio_seconds)
+            else:
+                synth_seconds = group_synth_seconds / max(1, len(group))
+            chars_per_second = (chunk_chars / synth_seconds) if synth_seconds > 0 else 0.0
+            realtime_factor = (audio_seconds / synth_seconds) if synth_seconds > 0 else 0.0
+            logging.info(
+                "CHUNK_METRICS current=%s total=%s chars=%s synth_s=%.2f audio_s=%.2f char_per_s=%.2f rtf=%.2f microbatch=%s",
+                current_batch,
+                total_batches,
+                chunk_chars,
+                synth_seconds,
+                audio_seconds,
+                chars_per_second,
+                realtime_factor,
+                len(group),
+            )
+            yield wav_array
+            remaining_batches = max(0, total_batches - current_batch)
+            logging.info(
+                "CHUNK_PROGRESS current=%s total=%s remaining=%s",
+                current_batch,
+                total_batches,
+                remaining_batches,
+            )
 
-        if gap_duration > 0 and i < total_batches - 1:
-            gap_samples = int(sample_rate * (gap_duration / 1000.0))
-            if gap_samples > 0:
-                yield np.zeros(gap_samples, dtype=np.float32)
+            gap_duration = 0
+            if force_sentence_gaps:
+                gap_duration = sentence_gap_ms
+            if question_gap_ms > 0 and batch_text.rstrip().endswith("?"):
+                gap_duration = max(gap_duration, question_gap_ms)
 
-        # Update statistics based on batch size
-        if stats:
-            update_stats(stats, len(batch_text))
-            if post_event:
-                post_event('CORE_PROGRESS', stats=stats)
+            if gap_duration > 0 and current_batch < total_batches:
+                gap_samples = int(sample_rate * (gap_duration / 1000.0))
+                if gap_samples > 0:
+                    yield np.zeros(gap_samples, dtype=np.float32)
+
+            # Update statistics based on batch size
+            if stats:
+                update_stats(stats, len(batch_text))
+                if post_event:
+                    post_event('CORE_PROGRESS', stats=stats)
     return
 
 
