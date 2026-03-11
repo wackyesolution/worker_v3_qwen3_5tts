@@ -8,6 +8,7 @@ import logging
 import json
 import os
 import sys
+import importlib.util
 from glob import glob
 
 import torch
@@ -257,15 +258,56 @@ def _is_qwen_sampling_instability(exc: BaseException) -> bool:
     )
 
 
+def _flash_attn_installed() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def _log_qwen_runtime_diagnostics(model_wrapper: Any, dtype_name: str) -> None:
+    model = getattr(model_wrapper, "model", None)
+    model_device = str(getattr(model_wrapper, "device", "unknown"))
+    model_param_dtype = "unknown"
+    resolved_attn = None
+    try:
+        if model is not None:
+            first_param = next(model.parameters(), None)
+            if first_param is not None:
+                model_param_dtype = str(first_param.dtype)
+                model_device = str(first_param.device)
+            cfg = getattr(model, "config", None)
+            if cfg is not None:
+                resolved_attn = getattr(cfg, "_attn_implementation", None) or getattr(
+                    cfg, "attn_implementation", None
+                )
+    except Exception:
+        pass
+
+    logging.info(
+        "QWEN_RUNTIME torch=%s cuda_available=%s torch_cuda=%s flash_attn_installed=%s "
+        "requested_attn=%s resolved_attn=%s requested_dtype=%s model_param_dtype=%s model_device=%s",
+        torch.__version__,
+        torch.cuda.is_available(),
+        torch.version.cuda,
+        _flash_attn_installed(),
+        QWEN_ATTN_IMPL or "default",
+        resolved_attn or "default",
+        dtype_name,
+        model_param_dtype,
+        model_device,
+    )
+
+
 def load_qwen_resources() -> Dict[str, Any]:
     if Qwen3TTSModel is None:
         raise RuntimeError("qwen-tts non installato. Installa il pacchetto per usare il worker qwen3_5.")
     if _QWEN_CACHE["model"] is None:
         from_pretrained_kwargs: Dict[str, Any] = {}
+        dtype_name = "default(cpu)"
         if torch.cuda.is_available():
             cuda_dtype, dtype_name = _resolve_qwen_cuda_dtype()
             from_pretrained_kwargs["device_map"] = "cuda:0"
-            from_pretrained_kwargs["dtype"] = cuda_dtype
+            # Transformers/Flash-Attn expect torch_dtype; using "dtype" can be
+            # ignored by some versions and trigger the FA2 warning.
+            from_pretrained_kwargs["torch_dtype"] = cuda_dtype
             if QWEN_ATTN_IMPL:
                 from_pretrained_kwargs["attn_implementation"] = QWEN_ATTN_IMPL
             logging.info(
@@ -294,6 +336,7 @@ def load_qwen_resources() -> Dict[str, Any]:
                 )
             else:
                 raise
+        _log_qwen_runtime_diagnostics(_QWEN_CACHE["model"], dtype_name)
     return {
         "engine": "qwen",
         "model": _QWEN_CACHE["model"],
@@ -1523,6 +1566,14 @@ def gen_audio_segments(
         batches = batches[: int(max_sentences)]
 
     total_batches = len(batches)
+    logging.info(
+        "BATCH_CONFIG min_chars=%s max_chars=%s sentence_gap_ms=%s question_gap_ms=%s force_sentence_gaps=%s",
+        batch_min_chars,
+        batch_max_chars,
+        sentence_gap_ms,
+        question_gap_ms,
+        force_sentence_gaps,
+    )
     logging.info(f"Split {len(sentences)} sentences into {total_batches} batches")
 
     # Show some batch examples
@@ -1543,6 +1594,8 @@ def gen_audio_segments(
 
         if engine != "qwen":
             raise RuntimeError(f"Engine non supportato su worker_v3_qwen3_5tts: {engine}")
+        current_batch = i + 1
+        synth_start = time.perf_counter()
         wav_array = synthesize_with_qwen(
             tts_resources,
             batch_text,
@@ -1552,8 +1605,22 @@ def gen_audio_segments(
             repetition_penalty=repetition_penalty,
             top_k=top_k,
         )
+        synth_seconds = max(0.0, time.perf_counter() - synth_start)
+        chunk_chars = len(batch_text)
+        audio_seconds = float(np.asarray(wav_array).size) / float(sample_rate) if wav_array is not None else 0.0
+        chars_per_second = (chunk_chars / synth_seconds) if synth_seconds > 0 else 0.0
+        realtime_factor = (audio_seconds / synth_seconds) if synth_seconds > 0 else 0.0
+        logging.info(
+            "CHUNK_METRICS current=%s total=%s chars=%s synth_s=%.2f audio_s=%.2f char_per_s=%.2f rtf=%.2f",
+            current_batch,
+            total_batches,
+            chunk_chars,
+            synth_seconds,
+            audio_seconds,
+            chars_per_second,
+            realtime_factor,
+        )
         yield wav_array
-        current_batch = i + 1
         remaining_batches = max(0, total_batches - current_batch)
         logging.info(
             "CHUNK_PROGRESS current=%s total=%s remaining=%s",
