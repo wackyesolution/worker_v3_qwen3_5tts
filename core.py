@@ -61,10 +61,9 @@ QWEN_ATTN_IMPL = os.getenv("CHATTERBLEZ_QWEN_ATTN_IMPL", "flash_attention_2").st
 QWEN_DTYPE = os.getenv("CHATTERBLEZ_QWEN_DTYPE", "auto").strip().lower()
 _QWEN_CACHE: Dict[str, Any] = {"model": None}
 # Default chunk sizes for TTS batching.
-# Keep chunks reasonably small to avoid early EOS/truncation, but with the
-# lighter Qwen model we can afford a slightly larger max to reduce fragmentation.
-BATCH_MIN_CHARS = max(80, int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "360")))
-BATCH_MAX_CHARS = max(BATCH_MIN_CHARS, int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "960")))
+# Keep chunks moderate to limit EOS/truncation and preserve pacing consistency.
+BATCH_MIN_CHARS = max(80, int(os.getenv("CHATTERBLEZ_BATCH_MIN_CHARS", "300")))
+BATCH_MAX_CHARS = max(BATCH_MIN_CHARS, int(os.getenv("CHATTERBLEZ_BATCH_MAX_CHARS", "650")))
 # Number of text batches sent in one Qwen generate call.
 QWEN_MICROBATCH_SIZE = max(1, int(os.getenv("CHATTERBLEZ_QWEN_MICROBATCH_SIZE", "9")))
 # Disabled dynamically if qwen-tts raises runtime errors for batched generation.
