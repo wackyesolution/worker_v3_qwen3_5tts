@@ -149,6 +149,8 @@ class VoiceTestRequest(BaseModel):
     sentence_gap_ms: Optional[int] = None
     question_gap_ms: Optional[int] = None
     disable_cleaning: bool = False
+    qwen_instruct: Optional[str] = None
+    qwen_speaker: Optional[str] = None
 
 
 class TrialRequest(VoiceTestRequest):
@@ -818,6 +820,8 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict, log_path: Op
         f"Preview text len={len(text)} disable_cleaning={payload.disable_cleaning} "
         f"use_multilingual={payload.use_multilingual} language_id={payload.language_id or 'it'}",
     )
+    qwen_instruct = str(payload.qwen_instruct or "").strip() or None
+    qwen_speaker = str(payload.qwen_speaker or "").strip() or None
     slug = slugify(user["username"])
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = AUDIO_PROVE_DIR / f"{slug}_{run_id}.wav"
@@ -825,7 +829,11 @@ def synthesize_voice_preview(payload: VoiceTestRequest, user: Dict, log_path: Op
         log_path,
         f"Loading TTS resources (multilingual={payload.use_multilingual})...",
     )
-    tts_resources = get_tts_resources_cached(payload.use_multilingual)
+    tts_resources = dict(get_tts_resources_cached(payload.use_multilingual))
+    if qwen_instruct:
+        tts_resources["instruct"] = qwen_instruct
+    if qwen_speaker:
+        tts_resources["speaker"] = qwen_speaker
     _append_trial_log(
         log_path,
         f"TTS ready (engine={tts_resources.get('engine')})",
