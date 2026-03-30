@@ -1170,10 +1170,11 @@ def run_pipeline(
     job_status = "failed"
     job_error: Optional[str] = None
     try:
-        import_path = Path(book["import_path"])
+        source_import_path = Path(book["import_path"])
+        import_path = source_import_path
         if not import_path.exists():
             raise HTTPException(status_code=404, detail="File del libro non trovato.")
-        slug = slugify(import_path.stem)
+        output_book_basename = import_path.stem
         if run_id_override:
             if not RUN_ID_PATTERN.fullmatch(run_id_override):
                 raise HTTPException(status_code=400, detail="run_id non valido.")
@@ -1214,6 +1215,7 @@ def run_pipeline(
                     preview_path = work_root / f"preview_{run_id}.txt"
                     preview_path.write_text(first_chapter_text, encoding="utf-8")
                     import_path = preview_path
+                    output_book_basename = import_path.stem
                     logging.info("Preview mode: preview file created at %s", preview_path)
             except Exception as exc:  # pragma: no cover - best effort
                 logging.warning("Preview mode setup failed, proceeding with full book: %s", exc)
@@ -1340,18 +1342,18 @@ def run_pipeline(
         # Final deliverables live under backend/users/ID<USER>/Books/book_<id>/.
         book_dir = book_export_dir(export_root, book["id"])
         book_dir.mkdir(parents=True, exist_ok=True)
-        final_folder = collect_dir / slug
+        final_folder = collect_dir / output_book_basename
 
         artifacts: List[Dict[str, str]] = []
-        chapter_audio = sorted(final_folder.glob(f"{slug}_{run_id}_chapter*.m4a"))
+        chapter_audio = sorted(final_folder.glob(f"{output_book_basename}_{run_id}_chapter*.m4a"))
         if not chapter_audio:
             raise HTTPException(
                 status_code=500,
                 detail="Nessun file per capitolo trovato dopo la conversione.",
             )
         chapter_count = len(chapter_audio)
-        final_m4a = final_folder / f"{slug}_{run_id}.m4a"
-        final_srt = final_folder / f"{slug}_{run_id}.srt"
+        final_m4a = final_folder / f"{output_book_basename}_{run_id}.m4a"
+        final_srt = final_folder / f"{output_book_basename}_{run_id}.srt"
         if not final_m4a.exists():
             raise HTTPException(
                 status_code=500,
@@ -1364,12 +1366,12 @@ def run_pipeline(
             dest_srt = book_dir / f"book_{book['id']}_{run_id}{final_srt.suffix.lower()}"
             shutil.copy2(final_srt, dest_srt)
             artifacts.append({"kind": "srt", "path": str(dest_srt)})
-        ebook_dest = book_dir / f"book_{book['id']}_{run_id}{import_path.suffix.lower()}"
-        shutil.copy2(import_path, ebook_dest)
+        ebook_dest = book_dir / f"book_{book['id']}_{run_id}{source_import_path.suffix.lower()}"
+        shutil.copy2(source_import_path, ebook_dest)
         artifacts.append({"kind": "ebook", "path": str(ebook_dest)})
 
         # Cleanup: drop per-chapter/temp outputs once final files are copied.
-        output_dir = output_base / f"{slug}_{run_id}"
+        output_dir = output_base / f"{output_book_basename}_{run_id}"
         for temp_dir in (output_dir, collect_dir):
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
