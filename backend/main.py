@@ -99,6 +99,7 @@ WORKER_UPLOAD_CHUNK_MB = int(os.getenv("WORKER_UPLOAD_CHUNK_MB", "25"))
 TRIAL_MODE = (os.getenv("TRIAL_MODE", "0") or "0").strip().lower() in {"1", "true", "yes", "y", "on"}
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", os.getenv("WORKER_WHISPER_MODEL", "small")).strip() or "small"
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "it").strip() or "it"
+DEFAULT_PREVIEW_MIN_WORDS = max(1, int(os.getenv("DEFAULT_PREVIEW_MIN_WORDS", "2000")))
 
 # FastAPI only matters in standalone mode; worker jobs exit after processing.
 app = FastAPI(title="Chatterblez Backend", version="1.0.0")
@@ -1191,7 +1192,7 @@ def run_pipeline(
         preview_path: Optional[Path] = None
         if preview_mode:
             try:
-                first_chapter_text = ""
+                preview_text = ""
                 suffix = import_path.suffix.lower()
                 chapters = None
                 if suffix == ".epub":
@@ -1202,18 +1203,45 @@ def run_pipeline(
                 elif suffix == ".txt":
                     chapters = extract_txt_chapters(str(import_path), book["title"])
                 if chapters:
-                    first = next((c for c in chapters if getattr(c, "extracted_text", "").strip()), chapters[0])
-                    first_chapter_text = (first.extracted_text or "").strip()
-                    selected_chapter_indices = [first.chapter_index]
-                    logging.info("Preview mode: using chapter %s (%s chars)", first.chapter_index, len(first_chapter_text))
-                if first_chapter_text:
-                    words = first_chapter_text.split()
+                    max_words = max_preview_words or 2200
+                    min_words = min(DEFAULT_PREVIEW_MIN_WORDS, max_words)
+                    collected_parts: List[str] = []
+                    collected_words = 0
+                    collected_indices: List[int] = []
+                    for chapter_position, chapter in enumerate(chapters):
+                        chapter_text = (getattr(chapter, "extracted_text", "") or "").strip()
+                        if not chapter_text:
+                            continue
+                        chapter_words = chapter_text.split()
+                        if not chapter_words:
+                            continue
+                        chapter_index = getattr(chapter, "chapter_index", chapter_position)
+                        collected_parts.append(chapter_text)
+                        collected_words += len(chapter_words)
+                        try:
+                            collected_indices.append(int(chapter_index))
+                        except (TypeError, ValueError):
+                            collected_indices.append(chapter_position)
+                        if collected_words >= min_words:
+                            break
+                    preview_text = "\n\n".join(collected_parts).strip()
+                    selected_chapter_indices = collected_indices or selected_chapter_indices
+                    logging.info(
+                        "Preview mode: using %s chapter(s) %s for %s words (min=%s max=%s)",
+                        len(collected_indices),
+                        collected_indices,
+                        collected_words,
+                        min_words,
+                        max_words,
+                    )
+                if preview_text:
+                    words = preview_text.split()
                     if max_preview_words and len(words) > max_preview_words:
                         words = words[:max_preview_words]
-                        first_chapter_text = " ".join(words)
+                        preview_text = " ".join(words)
                         logging.info("Preview mode: truncated to %s words", len(words))
                     preview_path = work_root / f"preview_{run_id}.txt"
-                    preview_path.write_text(first_chapter_text, encoding="utf-8")
+                    preview_path.write_text(preview_text, encoding="utf-8")
                     import_path = preview_path
                     output_book_basename = import_path.stem
                     logging.info("Preview mode: preview file created at %s", preview_path)
