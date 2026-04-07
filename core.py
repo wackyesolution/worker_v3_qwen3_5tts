@@ -1119,6 +1119,114 @@ def merge_hyphenated_lines(lines: list[str]) -> list[str]:
     return merged
 
 
+_SPOKEN_HEADING_KEYWORDS_RE = re.compile(
+    r"^(chapter|capitolo|part|parte|prologue|prologo|epilogue|epilogo|"
+    r"preface|prefazione|introduction|introduzione|appendix|appendice|"
+    r"foreword|afterword|interlude|intermezzo)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_heading_probe(value: str) -> str:
+    value = normalize_quotes(value or "")
+    value = re.sub(r"\.(?=\s|$)", " ", value)
+    value = re.sub(r"[_/\-]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    value = value.strip(" \t\r\n.,:;!?()[]{}\"'«»")
+    return value.casefold()
+
+
+def _build_heading_candidates(book_title: str, chapter_name: str) -> set[str]:
+    candidates: set[str] = set()
+
+    def add(value: str) -> None:
+        normalized = _normalize_heading_probe(value)
+        if normalized:
+            candidates.add(normalized)
+
+    add(book_title)
+    raw_name = str(chapter_name or "")
+    stem = Path(raw_name).stem
+    add(stem)
+    add(stem.replace("_", " "))
+    add(stem.replace("-", " "))
+    add(re.sub(r"[_\s-]+page[_\s-]+\d+$", "", stem, flags=re.IGNORECASE))
+    add(re.sub(r"[_\s-]+full[_\s-]+(?:document|text)$", "", stem, flags=re.IGNORECASE))
+    return candidates
+
+
+def _looks_like_title_heading(line: str) -> bool:
+    stripped = line.strip().strip(".,:;!?-–—()[]{}\"'«»")
+    words = re.findall(r"[0-9A-Za-z\u00C0-\u017F']+", stripped)
+    if not words or len(words) > 10 or len(stripped) > 100:
+        return False
+    alpha_words = [word for word in words if re.search(r"[A-Za-z\u00C0-\u017F]", word)]
+    if not alpha_words:
+        return False
+    capitalized_words = sum(1 for word in alpha_words if word[:1].isupper() or word.isupper())
+    return capitalized_words / max(1, len(alpha_words)) >= 0.7
+
+
+def _should_strip_leading_spoken_heading_line(
+    line: str,
+    *,
+    next_line: str,
+    book_title: str,
+    chapter_name: str,
+) -> bool:
+    normalized_line = _normalize_heading_probe(line)
+    if not normalized_line:
+        return False
+
+    heading_candidates = _build_heading_candidates(book_title, chapter_name)
+    if normalized_line in heading_candidates:
+        return True
+
+    normalized_title = _normalize_heading_probe(book_title)
+    if normalized_title:
+        if normalized_line.startswith(normalized_title) or normalized_title.startswith(normalized_line):
+            if len(normalized_line) >= max(8, int(len(normalized_title) * 0.6)):
+                return True
+
+    if _SPOKEN_HEADING_KEYWORDS_RE.match(normalized_line) and len(normalized_line.split()) <= 12:
+        return True
+
+    normalized_next_line = _normalize_heading_probe(next_line)
+    if normalized_next_line and _looks_like_title_heading(line):
+        if len(normalized_next_line) > max(60, len(normalized_line) + 20):
+            return True
+
+    return False
+
+
+def strip_leading_spoken_heading_lines(lines: list[str], *, book_title: str, chapter_name: str) -> list[str]:
+    trimmed_lines = list(lines)
+    removed_lines: list[str] = []
+    max_heading_lines = 3
+
+    while len(trimmed_lines) > 1 and len(removed_lines) < max_heading_lines:
+        current_line = trimmed_lines[0].strip()
+        next_line = trimmed_lines[1].strip() if len(trimmed_lines) > 1 else ""
+        if not _should_strip_leading_spoken_heading_line(
+            current_line,
+            next_line=next_line,
+            book_title=book_title,
+            chapter_name=chapter_name,
+        ):
+            break
+        removed_lines.append(trimmed_lines.pop(0))
+
+    if removed_lines:
+        logging.info(
+            "STRIPPED_CHAPTER_HEADINGS chapter=%s removed=%s first=%s",
+            chapter_name,
+            len(removed_lines),
+            re.sub(r"\s+", " ", removed_lines[0]).strip()[:120],
+        )
+
+    return trimmed_lines
+
+
 def split_sentence_by_length(text: str, max_chars: int) -> List[str]:
     """Split a single (very long) sentence into <= max_chars chunks on word boundaries."""
     words = text.split()
@@ -1391,6 +1499,11 @@ def main(file_path, pick_manually, speed, book_year='', output_folder='.',
     global_chunk_total = 0
     for idx, chapter in enumerate(selected_chapters, start=1):
         lines = chapter.extracted_text.splitlines()
+        lines = strip_leading_spoken_heading_lines(
+            lines,
+            book_title=title,
+            chapter_name=chapter.get_name(),
+        )
         cleaned_lines = []
         for line in lines:
             cleaned_line = clean_line(line)
