@@ -1998,17 +1998,8 @@ def find_document_chapters_and_extract_texts(book):
         xml = chapter.get_body_content()
         soup = BeautifulSoup(xml, features='lxml')
         chapter.extracted_text = ''
-        html_content_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'li']
-        seen_body_content = False
-        for node in soup.find_all(html_content_tags):
-            text = node.text.strip() if node.text else ''
-            if not text:
-                continue
-            if not seen_body_content and node.name in {'h1', 'h2', 'h3', 'h4'}:
-                logging.info("Skipping leading chapter heading from spoken text: %s", text[:120])
-                continue
-            if node.name in {'p', 'li'}:
-                seen_body_content = True
+        html_content_tags = ['title', 'p', 'h1', 'h2', 'h3', 'h4', 'li']
+        for text in [c.text.strip() for c in soup.find_all(html_content_tags) if c.text]:
             if not text.endswith('.'):
                 text += '.'
             chapter.extracted_text += text + '\n'
